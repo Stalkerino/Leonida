@@ -1,7 +1,7 @@
 // Synthetic BeginRenderPass/EndRenderPass replay check: no Vulkan loader, GPU, shaders or game data. The mock
-// captures the VkRenderingInfo handed to vkCmdBeginRendering and checks load/store ops, clear values, compaction,
-// aspect handling, the pass-snapshot draw path, scope gates and the unresolved-resource gate
-// (docs/d3d12_vulkan.md section 4.3).
+// captures the VkRenderingInfo handed to vkCmdBeginRendering and checks load/store ops, clear values, original-slot
+// (no compaction) colour attachments, aspect handling, the pass-snapshot draw path, scope gates and the
+// unresolved-resource gate (docs/d3d12_vulkan.md section 4.3).
 #include "../src/vulkan_replay.h"
 #include <cstdint>
 #include <cstdio>
@@ -108,16 +108,23 @@ leonida::ResourceBinding binding(VkFormat format, VkImageAspectFlags aspects) {
 }
 
 const leonida::ResourceBinding color = binding(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+const leonida::ResourceBinding color2 = [] {
+    leonida::ResourceBinding b = binding(VK_FORMAT_R16G16B16A16_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+    b.image = reinterpret_cast<VkImage>(std::uintptr_t{2});  // distinct handle: a distinct captured view
+    return b;
+}();
 const leonida::ResourceBinding depth_stencil =
     binding(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 const leonida::ResourceBinding depth_only = binding(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
-// The one graphics pipeline used by the draw-in-a-pass test. Its colour format matches the captured RTV.
+// The graphics pipeline used by the draw-in-a-pass tests. Its colour formats match the captured RTVs.
 leonida::GraphicsPipeline graphics;
+leonida::GraphicsPipeline* current_pipeline = nullptr;
 
 const leonida::ResourceBinding* resolve(leonida::ResourceId id) {
     if (id == 1) return &color;
     if (id == 2) return &depth_stencil;
     if (id == 3) return &depth_only;
+    if (id == 4) return &color2;
     return nullptr;
 }
 
@@ -126,12 +133,16 @@ leonida::ReplayFunctions functions() {
     vk.pipeline_barrier = barrier;
     vk.begin_rendering = begin;
     vk.end_rendering = end;
-    vk.image_view = [](const auto&, const auto&) { return reinterpret_cast<VkImageView>(std::uintptr_t{7}); };
+    vk.image_view = [](const auto& b, const auto&) {
+        const bool second = b.image == reinterpret_cast<VkImage>(std::uintptr_t{2});
+        return reinterpret_cast<VkImageView>(static_cast<std::uintptr_t>(second ? 8 : 7));
+    };
     vk.bind_pipeline = bind_pipeline;
     vk.push_constants = push_constants;
     vk.set_viewport = set_viewport;
     vk.set_scissor = set_scissor;
     vk.set_primitive_topology = set_topology;
+    vk.set_primitive_restart_enable = [](VkCommandBuffer, VkBool32) {};  // required by prepare_draw
     vk.set_stencil_reference = set_stencil_ref;
     vk.set_blend_constants = set_blend;
     vk.bind_vertex_buffers2 = bind_vb;
@@ -140,7 +151,7 @@ leonida::ReplayFunctions functions() {
     vk.draw_indexed = draw_indexed;
     vk.dispatch = dispatch;
     vk.buffer_at = [](std::uint64_t, std::uint64_t&, VkBuffer&, VkDeviceSize&) { return false; };
-    vk.graphics_pipeline = [](std::uintptr_t) -> const leonida::GraphicsPipeline* { return &graphics; };
+    vk.graphics_pipeline = [](std::uintptr_t) -> const leonida::GraphicsPipeline* { return current_pipeline; };
     return vk;
 }
 
@@ -167,6 +178,7 @@ leonida::ReplayResult run(const leonida::CommandList& list, const leonida::Repla
 
 int main() {
     using leonida::ReplayResult;
+    current_pipeline = &graphics;
     graphics.pipeline = reinterpret_cast<VkPipeline>(std::uintptr_t{9});
     graphics.layout = reinterpret_cast<VkPipelineLayout>(std::uintptr_t{11});
     graphics.color_formats = {VK_FORMAT_R8G8B8A8_UNORM};
@@ -195,8 +207,8 @@ int main() {
            "the recorded clear colour is used");
     expect(seen.color_store[0] == VK_ATTACHMENT_STORE_OP_NONE, "DISCARD stores nothing");
 
-    // Passive NO_ACCESS slots are dropped, the rest are compacted into shader-output order, and an active
-    // NO_ACCESS beginning is DONT_CARE (never LOAD/CLEAR) while its ending stores nothing.
+    // A passive NO_ACCESS slot keeps its original index with a null image view; the active slots keep theirs. An
+    // active NO_ACCESS beginning is DONT_CARE (never LOAD/CLEAR) while an ending of NO_ACCESS stores nothing.
     leonida::BeginRenderPass mixed = pass(B::clear, E::preserve);
     leonida::RenderPassColor passive{};
     passive.view = leonida::TargetView{999, 0, 0, 1};  // would be unresolved if it were touched
@@ -207,17 +219,41 @@ int main() {
     no_load.view = leonida::TargetView{1, 0, 0, 1};
     no_load.ending.type = E::preserve;
     mixed.colors.push_back(no_load);
-    leonida::CommandList compacted;
-    expect(compacted.begin_render_pass(mixed) && compacted.end_render_pass() && compacted.close(),
+    leonida::CommandList holed;
+    expect(holed.begin_render_pass(mixed) && holed.end_render_pass() && holed.close(),
            "record a pass with passive NO_ACCESS slots");
-    expect(run(compacted, vk) == ReplayResult::success, "passive slots are not resolved");
-    expect(seen.colors == 2, "passive slots dropped from the rendering scope");
-    expect(seen.color_load[0] == VK_ATTACHMENT_LOAD_OP_CLEAR &&
-               seen.color_store[0] == VK_ATTACHMENT_STORE_OP_STORE,
-           "first active slot keeps CLEAR/PRESERVE after compaction");
-    expect(seen.color_load[1] == VK_ATTACHMENT_LOAD_OP_DONT_CARE &&
+    expect(run(holed, vk) == ReplayResult::success, "passive slots are not resolved");
+    expect(seen.colors == 3, "the scope covers through the highest active slot");
+    expect(seen.color_view[0] == VK_NULL_HANDLE, "the passive slot keeps its index with a null view");
+    expect(seen.color_view[1] != VK_NULL_HANDLE && seen.color_load[1] == VK_ATTACHMENT_LOAD_OP_CLEAR &&
                seen.color_store[1] == VK_ATTACHMENT_STORE_OP_STORE,
-           "active NO_ACCESS beginning is DONT_CARE, ending PRESERVE stores");
+           "slot 1 keeps CLEAR/PRESERVE and its view");
+    expect(seen.color_view[2] != VK_NULL_HANDLE && seen.color_load[2] == VK_ATTACHMENT_LOAD_OP_DONT_CARE &&
+               seen.color_store[2] == VK_ATTACHMENT_STORE_OP_STORE,
+           "slot 2 keeps DONT_CARE/PRESERVE and its view");
+
+    // Interior passive slot with a distinct RTV at slot 2: no compaction, so shader output location 2 still lands
+    // on that RTV. The view handle differs from slot 0's, so a shifted mapping would be visible here.
+    leonida::BeginRenderPass spaced = pass(B::preserve, E::preserve);
+    leonida::RenderPassColor gap{};
+    gap.view = leonida::TargetView{999, 0, 0, 1};
+    gap.beginning.type = B::no_access;
+    gap.ending.type = E::no_access;
+    spaced.colors.push_back(gap);
+    leonida::RenderPassColor last{};
+    last.view = leonida::TargetView{4, 0, 0, 1};
+    last.beginning.type = B::preserve;
+    last.ending.type = E::preserve;
+    spaced.colors.push_back(last);
+    leonida::CommandList spaced_list;
+    expect(spaced_list.begin_render_pass(spaced) && spaced_list.end_render_pass() && spaced_list.close(),
+           "record a pass with an interior NO_ACCESS slot");
+    expect(run(spaced_list, vk) == ReplayResult::success, "the interior passive slot is not resolved");
+    expect(seen.colors == 3, "colorAttachmentCount is the highest active slot plus one");
+    expect(seen.color_view[0] == reinterpret_cast<VkImageView>(std::uintptr_t{7}), "slot 0 keeps its view");
+    expect(seen.color_view[1] == VK_NULL_HANDLE, "slot 1 (NO_ACCESS) has a null image view");
+    expect(seen.color_view[2] == reinterpret_cast<VkImageView>(std::uintptr_t{8}),
+           "slot 2 keeps its own view at index 2");
 
     // Both DSV planes active: one image view (VUID 06085), independent ops and clear values.
     leonida::BeginRenderPass ds = pass(B::clear, E::preserve);
@@ -287,6 +323,28 @@ int main() {
     expect(seen.bound == graphics.pipeline, "the PSO matches the captured pass formats");
     expect(seen.barriers_inside == 0 && seen.dispatches_inside == 0, "no barrier or dispatch inside the scope");
 
+    // A draw in a pass with an interior passive slot matches PSO formats by ORIGINAL slot index. The passive slot's
+    // pipeline format is turned UNDEFINED through `variant`; the two active slots keep theirs. Compaction would
+    // report an unsupported format mismatch here (slot 1 would compare RGBA16F against RGBA8).
+    leonida::GraphicsPipeline three = graphics;
+    three.color_formats = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_UNORM};
+    std::uint32_t variant_mask = 0;
+    three.variant = [&variant_mask](std::uint32_t m) {
+        variant_mask = m;
+        return reinterpret_cast<VkPipeline>(std::uintptr_t{13});
+    };
+    leonida::CommandList spaced_draw;
+    expect(spaced_draw.begin_render_pass(spaced) && spaced_draw.draw(draw) && spaced_draw.end_render_pass() &&
+               spaced_draw.close(),
+           "record a draw in a pass with an interior passive slot");
+    current_pipeline = &three;
+    const ReplayResult spaced_result = run(spaced_draw, vk);
+    current_pipeline = &graphics;
+    expect(spaced_result == ReplayResult::success, "pass-draw format matching keeps original slot indices");
+    expect(variant_mask == (1u << 1), "only the passive slot gets an UNDEFINED pipeline format");
+    expect(seen.draws == 1 && seen.bound == reinterpret_cast<VkPipeline>(std::uintptr_t{13}),
+           "the draw binds the slot-preserving variant");
+
     // Commands Vulkan forbids inside a rendering scope are refused in prepare, before any command buffer is touched.
     leonida::CommandList bad_dispatch;
     leonida::Dispatch dispatch{};
@@ -323,6 +381,6 @@ int main() {
            "a pass needs vkCmdBeginRendering");
 
     if (failures) return 1;
-    std::printf("replay_render_pass_test: compaction, pass-snapshot draw, DSV aspects, scope gates PASS\n");
+    std::printf("replay_render_pass_test: slot-preserving attachments, pass-snapshot draw, DSV aspects, scope gates PASS\n");
     return 0;
 }

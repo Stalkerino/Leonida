@@ -357,10 +357,13 @@ int main() {
         CHECK(begun.depth_stencil->depth_ending.type == e::no_access);
         CHECK(begun.depth_stencil->stencil_ending.type == e::discard);
         // The active-slot snapshot is taken at record time: slot 0 and depth are active, stencil is passive, and a
-        // passive colour slot never enters the mask (replay compacts the remaining MRT slots).
+        // passive colour slot never enters the mask (replay keeps original slots; passive ones get a null view).
         CHECK(begun.active_color_mask == 1u && begun.depth_active && !begun.stencil_active);
 
         CHECK(rp.reset() && !rp.render_pass_open());
+        auto bad_depth = pass;
+        bad_depth.depth_stencil->depth_beginning.depth = 1.5f;
+        CHECK(!rp.begin_render_pass(bad_depth));  // a CLEAR depth outside [0,1] is refused, as in clear_depth_stencil
         auto bad = pass;
         bad.flags = f::allow_uav_writes;
         CHECK(!rp.begin_render_pass(bad));

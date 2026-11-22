@@ -514,8 +514,8 @@ struct BeginRenderPass {
     std::vector<RenderPassColor> colors;
     std::optional<RenderPassDepthStencil> depth_stencil;
     std::uint32_t flags = 0;
-    // Captured at record time from the access types. A passive colour slot is dropped in replay and the remaining
-    // MRT slots are compacted; a plane is only attached when its access is active and its aspect is present.
+    // Captured at record time from the access types. A passive colour slot keeps its index in replay with a null
+    // image view; a plane is only attached when its access is active and its aspect is present.
     std::uint32_t active_color_mask = 0;  // bit i: original RTV slot i is active
     bool depth_active = false;
     bool stencil_active = false;
@@ -523,7 +523,7 @@ struct BeginRenderPass {
 struct EndRenderPass {};
 
 // A colour slot with NO_ACCESS at both ends (no CLEAR, nothing stored) is passive: replay neither binds nor
-// transitions it, and compacts shader output k to the k-th active slot.
+// transitions it, but keeps its index with a null view so shader output k still reaches attachment k.
 inline bool render_pass_color_active(std::uint32_t beginning, std::uint32_t ending) {
     return beginning != d3d12_render_beginning::no_access ||
            (ending != d3d12_render_ending::no_access && ending != d3d12_render_ending::discard);
@@ -840,6 +840,8 @@ public:
         if (pass.depth_stencil) {
             const auto& d = *pass.depth_stencil;
             if (!valid(d.view)) return false;
+            if (d.depth_beginning.type == d3d12_render_beginning::clear &&
+                !(d.depth_beginning.depth >= 0.0f && d.depth_beginning.depth <= 1.0f)) return false;
             const RenderPassAccess* accesses[] = {&d.depth_beginning, &d.stencil_beginning,
                                                   &d.depth_ending, &d.stencil_ending};
             for (std::size_t i = 0; i < 4; ++i) {
@@ -859,7 +861,7 @@ public:
             recorded.stencil_active = render_pass_plane_active(recorded.depth_stencil->stencil_beginning.type,
                                                                recorded.depth_stencil->stencil_ending.type);
         }
-        if (!append(std::move(recorded))) return false;
+        if (!append(recorded)) return false;  // append copies; std::move had no effect
         render_pass_open_ = true;
         return true;
     }

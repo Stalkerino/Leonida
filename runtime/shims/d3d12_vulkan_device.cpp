@@ -3384,26 +3384,12 @@ private:
         }
         multisample.pSampleMask = &r.sample_mask;
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
-        // VUID-VkGraphicsPipelineCreateInfo-renderPass-06055: with dynamic rendering, the blend attachment count must
-        // equal the rendering colour-attachment count. A count-changing variant therefore takes the first `colors`
-        // blend states (or neutral ones for slots the PSO never declared).
-        std::vector<VkPipelineColorBlendAttachmentState> blend_states;
-        blend_states.reserve(colors.size());
-        for (std::size_t slot = 0; slot < colors.size(); ++slot) {
-            if (slot < r.blends.size()) {
-                blend_states.push_back(r.blends[slot]);
-            } else {
-                // Replicate slot 0 (without independentBlend all entries must be identical, VUID 00605).
-                VkPipelineColorBlendAttachmentState neutral{};
-                if (!r.blends.empty()) {
-                    neutral = r.blends[0];
-                } else {
-                    neutral.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-                }
-                blend_states.push_back(neutral);
-            }
-        }
+        // VUID-VkGraphicsPipelineCreateInfo-renderPass-06055: the blend attachment count must equal the rendering
+        // colour-attachment count. VUID 06062: a slot the PSO did not declare, or whose format the pass reinterprets
+        // or leaves UNDEFINED, must not carry blendEnable=TRUE. The helper keeps only states whose format is the
+        // PSO's own and zeroes the rest.
+        const std::vector<VkPipelineColorBlendAttachmentState> blend_states =
+            leonida::variant_blend_states(r.blends, colors, graphics_.color_formats);
         blend.attachmentCount = std::uint32_t(blend_states.size());
         blend.pAttachments = blend_states.empty() ? nullptr : blend_states.data();
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};

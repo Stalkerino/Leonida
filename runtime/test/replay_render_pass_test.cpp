@@ -404,6 +404,29 @@ int main() {
            "the pipeline declares 1 colour attachment, matching the pass count (VUID 06179)");
     expect(seen.bound == truncated, "the draw binds the truncated variant");
 
+    // RISK (VUID-VkGraphicsPipelineCreateInfo-renderPass-06062): a padded or pass-reinterpreted slot must not inherit
+    // the PSO's blendEnable=TRUE — its format may lack COLOR_ATTACHMENT_BLEND_BIT. The device shim and this test share
+    // the helper; capture its blend states directly (the mock never calls vkCreateGraphicsPipelines).
+    VkPipelineColorBlendAttachmentState blended{};
+    blended.blendEnable = VK_TRUE;
+    blended.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blended.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blended.colorWriteMask = 0xf;
+    const std::vector<VkPipelineColorBlendAttachmentState> base{blended};
+    const auto padded = leonida::variant_blend_states(
+        base, {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_UNDEFINED, VK_FORMAT_R32_UINT}, {VK_FORMAT_R8G8B8A8_UNORM});
+    expect(padded.size() == 3 && padded[0].blendEnable == VK_TRUE && padded[0].colorWriteMask == 0xf,
+           "the PSO's own real-format slot keeps its blend state");
+    expect(padded[1].blendEnable == VK_FALSE && padded[2].blendEnable == VK_FALSE &&
+               padded[1].colorWriteMask == 0xf && padded[2].colorWriteMask == 0xf,
+           "the UNDEFINED pad slot and the integer-format pad slot disable blending (VUID 06062); the write mask "
+           "stays identical for VUID 00605");
+    const auto reinterpreted =
+        leonida::variant_blend_states(base, {VK_FORMAT_R8G8B8A8_UNORM}, {VK_FORMAT_UNDEFINED});
+    expect(reinterpreted.size() == 1 && reinterpreted[0].blendEnable == VK_FALSE &&
+               reinterpreted[0].colorWriteMask == 0xf,
+           "a slot reinterpreted by the pass disables blending");
+
     // A genuine format clash at an active slot (both real but different) is still refused before emit.
     leonida::GraphicsPipeline wrong = graphics;
     wrong.color_formats = {VK_FORMAT_R16G16B16A16_UNORM};  // pass slot 0 is RGBA8

@@ -768,6 +768,31 @@ struct GraphicsPipeline {
         variant_attachments;
 };
 
+// Blend attachments for a pipeline variant whose rendering declaration is `colors`. The PSO declared `base` states
+// by render-target slot and `declared` formats for those slots. A padded slot, an UNDEFINED slot or one reinterpreted
+// by the pass must not carry blendEnable=TRUE, because a format without
+// VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT forbids it (VUID-VkGraphicsPipelineCreateInfo-renderPass-06062).
+// The rest of the state, including colorWriteMask, is kept: when independentBlend is off every attachment must be
+// identical (VUID 00605), so zeroing the mask would trade one validity error for another.
+inline std::vector<VkPipelineColorBlendAttachmentState> variant_blend_states(
+    const std::vector<VkPipelineColorBlendAttachmentState>& base, const std::vector<VkFormat>& colors,
+    const std::vector<VkFormat>& declared) {
+    std::vector<VkPipelineColorBlendAttachmentState> states;
+    states.reserve(colors.size());
+    for (std::size_t slot = 0; slot < colors.size(); ++slot) {
+        if (slot < base.size() && slot < declared.size() && colors[slot] != VK_FORMAT_UNDEFINED &&
+            colors[slot] == declared[slot]) {
+            states.push_back(base[slot]);
+        } else {
+            VkPipelineColorBlendAttachmentState state{};
+            if (!base.empty()) state = slot < base.size() ? base[slot] : base[0];
+            state.blendEnable = VK_FALSE;
+            states.push_back(state);
+        }
+    }
+    return states;
+}
+
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
 struct ShaderUserData {
     std::uint32_t s[32];

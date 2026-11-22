@@ -182,7 +182,9 @@ leonida::BeginRenderPass pass(std::uint32_t begin = B::preserve, std::uint32_t f
     leonida::RenderPassColor c{};
     c.view = leonida::TargetView{1, 0, 0, 1};
     c.beginning.type = begin;
-    c.beginning.color = {0.25f, 0.5f, 0.75f, 1.0f};
+    // 0.2f/0.4f/0.6f are 51/102/153 over 255: exact on the 8-bit UNORM target, so the colour survives the D3D-style
+    // quantisation of render_target_clear_color (#589) unchanged and the expectation below stays exact either way.
+    c.beginning.color = {0.2f, 0.4f, 0.6f, 1.0f};
     c.ending.type = finish;
     p.colors.push_back(c);
     return p;
@@ -222,8 +224,8 @@ int main() {
            "record a CLEAR/DISCARD pass");
     expect(run(clear, vk) == ReplayResult::success, "replay a CLEAR/DISCARD pass");
     expect(seen.color_load[0] == VK_ATTACHMENT_LOAD_OP_CLEAR, "CLEAR maps to LOAD_OP_CLEAR");
-    expect(seen.color_clear[0].float32[0] == 0.25f && seen.color_clear[0].float32[1] == 0.5f &&
-               seen.color_clear[0].float32[2] == 0.75f && seen.color_clear[0].float32[3] == 1.0f,
+    expect(seen.color_clear[0].float32[0] == 0.2f && seen.color_clear[0].float32[1] == 0.4f &&
+               seen.color_clear[0].float32[2] == 0.6f && seen.color_clear[0].float32[3] == 1.0f,
            "the recorded clear colour is used");
     expect(seen.color_store[0] == VK_ATTACHMENT_STORE_OP_NONE, "DISCARD stores nothing");
 

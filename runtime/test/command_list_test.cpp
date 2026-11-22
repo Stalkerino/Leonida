@@ -356,9 +356,7 @@ int main() {
         CHECK(begun.depth_stencil->stencil_beginning.type == b::no_access);
         CHECK(begun.depth_stencil->depth_ending.type == e::no_access);
         CHECK(begun.depth_stencil->stencil_ending.type == e::discard);
-        // The active-slot snapshot is taken at record time: slot 0 and depth are active, stencil is passive, and a
-        // passive colour slot never enters the mask (replay keeps original slots; passive ones get a null view).
-        CHECK(begun.active_color_mask == 1u && begun.depth_active && !begun.stencil_active);
+        CHECK(begun.depth_active && !begun.stencil_active);
 
         CHECK(rp.reset() && !rp.render_pass_open());
         auto bad_depth = pass;
@@ -394,18 +392,18 @@ int main() {
         bad.flags = f::suspending | f::resuming;
         CHECK(!rp.begin_render_pass(bad));
 
-        // NO_ACCESS/NO_ACCESS colours are passive and are not in the mask; DISCARD beginnings are active.
-        auto compact = pass;
+        // Replay uses the recorded beginning access to select raster RTVs; DISCARD keeps a DSV plane active.
+        auto mixed = pass;
         RenderPassColor passive{};
         passive.view = TargetView{300, 0, 0, 1};
         passive.beginning.type = b::no_access;
         passive.ending.type = e::no_access;
-        compact.colors.push_back(passive);
-        compact.depth_stencil->depth_beginning.type = b::discard;
-        CHECK(rp.begin_render_pass(compact));
-        const auto& compacted = std::get<BeginRenderPass>(rp.commands()[0]);
-        CHECK(compacted.active_color_mask == 1u);  // only slot 0 is active
-        CHECK(compacted.depth_active);             // DISCARD is active, not a dropped NO_ACCESS attachment
+        mixed.colors.push_back(passive);
+        mixed.depth_stencil->depth_beginning.type = b::discard;
+        CHECK(rp.begin_render_pass(mixed));
+        const auto& recorded = std::get<BeginRenderPass>(rp.commands()[0]);
+        CHECK(recorded.colors.size() == 2 && recorded.colors[1].beginning.type == b::no_access);
+        CHECK(recorded.depth_active);
         CHECK(rp.end_render_pass());
     }
     return 0;

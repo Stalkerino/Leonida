@@ -1,10 +1,11 @@
 // Synthetic BeginRenderPass/EndRenderPass replay check: no Vulkan loader, GPU, shaders or game data. The mock
-// captures the VkRenderingInfo handed to vkCmdBeginRendering and checks load/store ops, clear values, original-slot
-// (no compaction) colour attachments, aspect handling, the pass-snapshot draw path, scope gates and the
+// captures the VkRenderingInfo handed to vkCmdBeginRendering and checks load/store ops, clear values, raster-bound
+// colour attachment order, aspect handling, the pass-snapshot draw path, scope gates and the
 // unresolved-resource gate (docs/d3d12_vulkan.md section 4.3).
 #include "../src/vulkan_replay.h"
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 namespace {
 struct Captured {
@@ -226,8 +227,7 @@ int main() {
            "the recorded clear colour is used");
     expect(seen.color_store[0] == VK_ATTACHMENT_STORE_OP_NONE, "DISCARD stores nothing");
 
-    // A passive NO_ACCESS slot keeps its original index with a null image view; the active slots keep theirs. An
-    // active NO_ACCESS beginning is DONT_CARE (never LOAD/CLEAR) while an ending of NO_ACCESS stores nothing.
+    // A NO_ACCESS beginning skips the RTV regardless of its ending access. The CLEAR attachment becomes target 0.
     leonida::BeginRenderPass mixed = pass(B::clear, E::preserve);
     leonida::RenderPassColor passive{};
     passive.view = leonida::TargetView{999, 0, 0, 1};  // would be unresolved if it were touched
@@ -235,24 +235,18 @@ int main() {
     passive.ending.type = E::no_access;
     mixed.colors.insert(mixed.colors.begin(), passive);
     leonida::RenderPassColor no_load = passive;
-    no_load.view = leonida::TargetView{1, 0, 0, 1};
     no_load.ending.type = E::preserve;
     mixed.colors.push_back(no_load);
     leonida::CommandList holed;
     expect(holed.begin_render_pass(mixed) && holed.end_render_pass() && holed.close(),
            "record a pass with passive NO_ACCESS slots");
     expect(run(holed, vk) == ReplayResult::success, "passive slots are not resolved");
-    expect(seen.colors == 3, "the scope covers through the highest active slot");
-    expect(seen.color_view[0] == VK_NULL_HANDLE, "the passive slot keeps its index with a null view");
-    expect(seen.color_view[1] != VK_NULL_HANDLE && seen.color_load[1] == VK_ATTACHMENT_LOAD_OP_CLEAR &&
-               seen.color_store[1] == VK_ATTACHMENT_STORE_OP_STORE,
-           "slot 1 keeps CLEAR/PRESERVE and its view");
-    expect(seen.color_view[2] != VK_NULL_HANDLE && seen.color_load[2] == VK_ATTACHMENT_LOAD_OP_DONT_CARE &&
-               seen.color_store[2] == VK_ATTACHMENT_STORE_OP_STORE,
-           "slot 2 keeps DONT_CARE/PRESERVE and its view");
+    expect(seen.colors == 1 && seen.barriers == 1, "only the raster-bound RTV is attached and transitioned");
+    expect(seen.color_view[0] == reinterpret_cast<VkImageView>(std::uintptr_t{7}) &&
+               seen.color_load[0] == VK_ATTACHMENT_LOAD_OP_CLEAR && seen.color_store[0] == VK_ATTACHMENT_STORE_OP_STORE,
+           "target 0 gets the CLEAR/PRESERVE view");
 
-    // Interior passive slot with a distinct RTV at slot 2: no compaction, so shader output location 2 still lands
-    // on that RTV. The view handle differs from slot 0's, so a shifted mapping would be visible here.
+    // An interior NO_ACCESS RTV is skipped. The distinct views show that the raster RTVs keep descriptor order.
     leonida::BeginRenderPass spaced = pass(B::preserve, E::preserve);
     leonida::RenderPassColor gap{};
     gap.view = leonida::TargetView{999, 0, 0, 1};
@@ -261,18 +255,18 @@ int main() {
     spaced.colors.push_back(gap);
     leonida::RenderPassColor last{};
     last.view = leonida::TargetView{4, 0, 0, 1};
-    last.beginning.type = B::preserve;
-    last.ending.type = E::preserve;
+    last.beginning.type = B::discard;
+    last.ending.type = E::no_access;
     spaced.colors.push_back(last);
     leonida::CommandList spaced_list;
     expect(spaced_list.begin_render_pass(spaced) && spaced_list.end_render_pass() && spaced_list.close(),
            "record a pass with an interior NO_ACCESS slot");
     expect(run(spaced_list, vk) == ReplayResult::success, "the interior passive slot is not resolved");
-    expect(seen.colors == 3, "colorAttachmentCount is the highest active slot plus one");
+    expect(seen.colors == 2, "colorAttachmentCount is the number of raster-bound RTVs");
     expect(seen.color_view[0] == reinterpret_cast<VkImageView>(std::uintptr_t{7}), "slot 0 keeps its view");
-    expect(seen.color_view[1] == VK_NULL_HANDLE, "slot 1 (NO_ACCESS) has a null image view");
-    expect(seen.color_view[2] == reinterpret_cast<VkImageView>(std::uintptr_t{8}),
-           "slot 2 keeps its own view at index 2");
+    expect(seen.color_view[1] == reinterpret_cast<VkImageView>(std::uintptr_t{8}) &&
+               seen.color_load[1] == VK_ATTACHMENT_LOAD_OP_DONT_CARE && seen.color_store[1] == VK_ATTACHMENT_STORE_OP_NONE,
+           "target 1 gets the DISCARD/NO_ACCESS view from descriptor 2");
 
     // Both DSV planes active: one image view (VUID 06085), independent ops and clear values.
     leonida::BeginRenderPass ds = pass(B::clear, E::preserve);
@@ -342,11 +336,21 @@ int main() {
     expect(seen.bound == graphics.pipeline, "the PSO matches the captured pass formats");
     expect(seen.barriers_inside == 0 && seen.dispatches_inside == 0, "no barrier or dispatch inside the scope");
 
-    // A draw in a pass with an interior passive slot matches PSO formats by ORIGINAL slot index. The passive slot's
-    // pipeline format is turned UNDEFINED through `variant`; the two active slots keep theirs. Compaction would
-    // report an unsupported format mismatch here (slot 1 would compare RGBA16F against RGBA8).
+    // A one-RTV PSO draws to target 0 in [NO_ACCESS, CLEAR], using the base pipeline.
+    mixed.colors.pop_back();
+    leonida::CommandList leading_gap;
+    expect(leading_gap.begin_render_pass(mixed) && leading_gap.draw(draw) && leading_gap.end_render_pass() &&
+               leading_gap.close(),
+           "record a one-RTV draw after a leading NO_ACCESS descriptor");
+    variant_calls = 0;
+    expect(run(leading_gap, vk) == ReplayResult::success && seen.colors == 1 &&
+               seen.color_view[0] == reinterpret_cast<VkImageView>(std::uintptr_t{7}) &&
+               seen.draws == 1 && seen.bound == graphics.pipeline && variant_calls == 0,
+           "target 0 reaches the first raster-bound RTV with the one-RTV PSO");
+
+    // PSO formats match the compacted slot order. A variant trims the extra PSO format to the scope's count.
     leonida::GraphicsPipeline three = graphics;
-    three.color_formats = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_UNORM};
+    three.color_formats = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
     const VkPipeline three_variant = reinterpret_cast<VkPipeline>(std::uintptr_t{13});
     attach_variant(three, three_variant);
     leonida::CommandList spaced_draw;
@@ -357,35 +361,33 @@ int main() {
     variant_calls = 0;
     const ReplayResult spaced_result = run(spaced_draw, vk);
     current_pipeline = &graphics;
-    expect(spaced_result == ReplayResult::success, "pass-draw format matching keeps original slot indices");
-    expect(variant_calls == 1 && variant_colors.size() == 3 && variant_colors[0] == VK_FORMAT_R8G8B8A8_UNORM &&
-               variant_colors[1] == VK_FORMAT_UNDEFINED && variant_colors[2] == VK_FORMAT_R16G16B16A16_UNORM,
-           "only the passive slot gets an UNDEFINED pipeline format, at its original index");
-    expect(seen.draws == 1 && seen.bound == three_variant, "the draw binds the slot-preserving variant");
+    expect(spaced_result == ReplayResult::success, "pass-draw format matching uses the raster slots");
+    expect(variant_calls == 1 && variant_colors.size() == 2 && variant_colors[0] == VK_FORMAT_R8G8B8A8_UNORM &&
+               variant_colors[1] == VK_FORMAT_R16G16B16A16_UNORM,
+           "the variant formats match the two raster-bound views in order");
+    expect(seen.draws == 1 && seen.bound == three_variant, "the draw binds the count-matched variant");
 
-    // BLOCKER (VUID-vkCmdDraw-colorAttachmentCount-06179): the PSO's RTV count and the pass's slot count are
-    // independent in D3D12. Both directions must yield a pipeline whose count equals the pass, not a silent invalid
-    // draw. The captured variant colour vector IS the pipeline's rendering count in this mock.
-    // (a) PSO 1 RTV inside a 3-slot pass: pad the passive slot and the extra active slot by slot format.
+    // Retain the replay fallback for a PSO with fewer formats than raster-bound RTVs. Its variant takes the
+    // extra attachment format from the pass to satisfy VUID 06179.
     leonida::GraphicsPipeline one_rtv = graphics;
     one_rtv.color_formats = {VK_FORMAT_R8G8B8A8_UNORM};
     const VkPipeline one_variant = reinterpret_cast<VkPipeline>(std::uintptr_t{14});
     attach_variant(one_rtv, one_variant);
-    leonida::CommandList one_in_three;
-    expect(one_in_three.begin_render_pass(spaced) && one_in_three.draw(draw) && one_in_three.end_render_pass() &&
-               one_in_three.close(),
-           "record a 1-RTV PSO draw in a 3-slot pass");
+    leonida::CommandList one_in_two;
+    expect(one_in_two.begin_render_pass(spaced) && one_in_two.draw(draw) && one_in_two.end_render_pass() &&
+               one_in_two.close(),
+           "record a 1-RTV PSO draw with two raster-bound RTVs");
     current_pipeline = &one_rtv;
     variant_calls = 0;
-    const ReplayResult one_result = run(one_in_three, vk);
+    const ReplayResult one_result = run(one_in_two, vk);
     current_pipeline = &graphics;
-    expect(one_result == ReplayResult::success, "a 1-RTV PSO in a 3-slot pass is replayed, not refused");
-    expect(variant_calls == 1 && variant_colors.size() == 3 && variant_colors[0] == VK_FORMAT_R8G8B8A8_UNORM &&
-               variant_colors[1] == VK_FORMAT_UNDEFINED && variant_colors[2] == VK_FORMAT_R16G16B16A16_UNORM,
-           "the pipeline declares 3 colour attachments, matching the pass count (VUID 06179)");
+    expect(one_result == ReplayResult::success, "the one-RTV fallback replays with two raster-bound RTVs");
+    expect(variant_calls == 1 && variant_colors.size() == 2 && variant_colors[0] == VK_FORMAT_R8G8B8A8_UNORM &&
+               variant_colors[1] == VK_FORMAT_R16G16B16A16_UNORM,
+           "the pipeline declares two colour attachments, matching the pass count (VUID 06179)");
     expect(seen.bound == one_variant, "the draw binds the count-matched variant");
 
-    // (b) PSO 3 RTVs inside a 1-slot pass: drop the extra RTVs so the pipeline declares one colour attachment.
+    // PSO 3 RTVs inside a 1-slot pass: the pipeline declares one colour attachment.
     leonida::GraphicsPipeline three_in_one = graphics;
     three_in_one.color_formats = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_UNORM};
     const VkPipeline truncated = reinterpret_cast<VkPipeline>(std::uintptr_t{15});
@@ -404,28 +406,42 @@ int main() {
            "the pipeline declares 1 colour attachment, matching the pass count (VUID 06179)");
     expect(seen.bound == truncated, "the draw binds the truncated variant");
 
-    // RISK (VUID-VkGraphicsPipelineCreateInfo-renderPass-06062): a padded or pass-reinterpreted slot must not inherit
-    // the PSO's blendEnable=TRUE — its format may lack COLOR_ATTACHMENT_BLEND_BIT. The device shim and this test share
-    // the helper; capture its blend states directly (the mock never calls vkCreateGraphicsPipelines).
+    // Capture the blend array produced by the helper used by vkCreateGraphicsPipelines. VUID 00605 compares
+    // the whole state even for undefined-format slots, which VUID 06062 skips.
     VkPipelineColorBlendAttachmentState blended{};
     blended.blendEnable = VK_TRUE;
     blended.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
     blended.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     blended.colorWriteMask = 0xf;
     const std::vector<VkPipelineColorBlendAttachmentState> base{blended};
+    const auto supports_blend = [](VkFormat format) {
+        return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R16G16B16A16_UNORM;
+    };
+    const auto same_state = [](const auto& a, const auto& b) { return std::memcmp(&a, &b, sizeof(a)) == 0; };
     const auto padded = leonida::variant_blend_states(
-        base, {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_UNDEFINED, VK_FORMAT_R32_UINT}, {VK_FORMAT_R8G8B8A8_UNORM});
-    expect(padded.size() == 3 && padded[0].blendEnable == VK_TRUE && padded[0].colorWriteMask == 0xf,
-           "the PSO's own real-format slot keeps its blend state");
-    expect(padded[1].blendEnable == VK_FALSE && padded[2].blendEnable == VK_FALSE &&
-               padded[1].colorWriteMask == 0xf && padded[2].colorWriteMask == 0xf,
-           "the UNDEFINED pad slot and the integer-format pad slot disable blending (VUID 06062); the write mask "
-           "stays identical for VUID 00605");
+        base, {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_UNDEFINED, VK_FORMAT_R16G16B16A16_UNORM},
+        {VK_FORMAT_R8G8B8A8_UNORM}, false, supports_blend);
+    expect(padded && padded->size() == 3 && same_state((*padded)[0], blended) &&
+               same_state((*padded)[1], blended) && same_state((*padded)[2], blended),
+           "both undefined and blend-capable padding keep the common blend state");
+
+    const std::vector<VkFormat> integer_rtv{VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT};
+    const std::vector<VkFormat> declared{VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_UNDEFINED};
+    expect(!leonida::variant_blend_states({blended, blended}, integer_rtv, declared, false, supports_blend),
+           "a newly used non-blendable format is refused without independentBlend");
     const auto reinterpreted =
-        leonida::variant_blend_states(base, {VK_FORMAT_R8G8B8A8_UNORM}, {VK_FORMAT_UNDEFINED});
-    expect(reinterpreted.size() == 1 && reinterpreted[0].blendEnable == VK_FALSE &&
-               reinterpreted[0].colorWriteMask == 0xf,
-           "a slot reinterpreted by the pass disables blending");
+        leonida::variant_blend_states({blended, blended}, integer_rtv, declared, true, supports_blend);
+    auto disabled = blended;
+    disabled.blendEnable = VK_FALSE;
+    expect(reinterpreted && reinterpreted->size() == 2 && same_state((*reinterpreted)[0], blended) &&
+               same_state((*reinterpreted)[1], disabled),
+           "independentBlend permits disabling blending only for the non-blendable real format");
+
+    // Outside a pass a variant unbinds a slot without changing the PSO's blend array.
+    const auto unbound = leonida::variant_blend_states(
+        {blended, blended}, declared, {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_UNORM}, false, supports_blend);
+    expect(unbound && unbound->size() == 2 && same_state((*unbound)[0], blended) && same_state((*unbound)[1], blended),
+           "unbinding an OM RTV preserves both original blend states");
 
     // A genuine format clash at an active slot (both real but different) is still refused before emit.
     leonida::GraphicsPipeline wrong = graphics;
@@ -507,6 +523,7 @@ int main() {
            "a pass needs vkCmdBeginRendering");
 
     if (failures) return 1;
-    std::printf("replay_render_pass_test: slot-preserving attachments, pass-snapshot draw, DSV aspects, scope gates PASS\n");
+    std::printf("replay_render_pass_test: raster attachment order, blend states, pass-snapshot draw, DSV aspects, "
+                "scope gates PASS\n");
     return 0;
 }

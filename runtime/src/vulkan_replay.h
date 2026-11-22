@@ -768,27 +768,23 @@ struct GraphicsPipeline {
         variant_attachments;
 };
 
-// Blend attachments for a pipeline variant whose rendering declaration is `colors`. The PSO declared `base` states
-// by render-target slot and `declared` formats for those slots. A padded slot, an UNDEFINED slot or one reinterpreted
-// by the pass must not carry blendEnable=TRUE, because a format without
-// VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT forbids it (VUID-VkGraphicsPipelineCreateInfo-renderPass-06062).
-// The rest of the state, including colorWriteMask, is kept: when independentBlend is off every attachment must be
-// identical (VUID 00605), so zeroing the mask would trade one validity error for another.
-inline std::vector<VkPipelineColorBlendAttachmentState> variant_blend_states(
+// Preserve the PSO's blend states when a variant drops or unbinds slots. An UNDEFINED format has no attachment,
+// so VUID 06062 does not apply. With independentBlend disabled, even these slots must match the common state
+// (VUID 00605). A newly used format can require disabling blending on its slot, which needs independentBlend.
+template<typename SupportsBlend>
+std::optional<std::vector<VkPipelineColorBlendAttachmentState>> variant_blend_states(
     const std::vector<VkPipelineColorBlendAttachmentState>& base, const std::vector<VkFormat>& colors,
-    const std::vector<VkFormat>& declared) {
-    std::vector<VkPipelineColorBlendAttachmentState> states;
-    states.reserve(colors.size());
+    const std::vector<VkFormat>& declared, bool independent_blend, SupportsBlend&& supports_blend) {
+    const VkPipelineColorBlendAttachmentState common =
+        base.empty() ? VkPipelineColorBlendAttachmentState{} : base.front();
+    std::vector<VkPipelineColorBlendAttachmentState> states = base;
+    states.resize(colors.size(), common);
     for (std::size_t slot = 0; slot < colors.size(); ++slot) {
-        if (slot < base.size() && slot < declared.size() && colors[slot] != VK_FORMAT_UNDEFINED &&
-            colors[slot] == declared[slot]) {
-            states.push_back(base[slot]);
-        } else {
-            VkPipelineColorBlendAttachmentState state{};
-            if (!base.empty()) state = slot < base.size() ? base[slot] : base[0];
-            state.blendEnable = VK_FALSE;
-            states.push_back(state);
-        }
+        if (!states[slot].blendEnable || colors[slot] == VK_FORMAT_UNDEFINED ||
+            (slot < declared.size() && colors[slot] == declared[slot]) || supports_blend(colors[slot]))
+            continue;
+        if (!independent_blend) return std::nullopt;
+        states[slot].blendEnable = VK_FALSE;
     }
     return states;
 }
@@ -1175,7 +1171,7 @@ inline VkExtent2D mip_extent(const ResourceBinding& resource, std::uint32_t mip)
     return {std::max(1u, resource.width >> mip), std::max(1u, resource.height >> mip)};
 }
 
-// D3D12 render-pass accesses to Vulkan load/store ops. A beginning NO_ACCESS is DONT_CARE, never LOAD or CLEAR:
+// D3D12 render-pass accesses to Vulkan load/store ops. For an attached DSV plane, a beginning NO_ACCESS is DONT_CARE:
 // core Vulkan 1.3 has no "no load" op (VK_ATTACHMENT_LOAD_OP_NONE needs VK_KHR_load_store_op_none), so this is a
 // deliberate conservative mapping, documented in docs/d3d12_vulkan.md. An ending NO_ACCESS (and DISCARD) stores
 // nothing at all; an ending PRESERVE stores the contents.
@@ -1996,17 +1992,15 @@ namespace detail {
 // A draw inside BeginRenderPass must use the pass's captured attachments, not the OM render targets recorded with
 // the draw (D3D12 ignores the OM bindings while a pass is active). Formats come from the pass snapshot so Vulkan's
 // render-pass/pipeline format agreement (VUID 08910) holds even when a slot was rewritten or is stale.
-// The active BeginRenderPass snapshot, used by draws inside the scope. Original OM slot indices are preserved:
-// a passive NO_ACCESS slot keeps its index with a null image view and VK_FORMAT_UNDEFINED, so shader output
-// location k still maps to colour attachment k. Formats come from the captured views, never from the stale OM
-// binding (Vulkan VUID 08910). Layout transitions happen once, before vkCmdBeginRendering (VUID 09553).
+// The active BeginRenderPass snapshot, used by draws inside the scope. Formats come from the captured,
+// raster-bound views (VUID 08910). Layout transitions happen once, before vkCmdBeginRendering (VUID 09553).
 struct RenderPassView {
-    std::vector<PreparedDraw::Attachment> colors;  // by original OM slot; passive slots have a null view
+    std::vector<PreparedDraw::Attachment> colors;  // raster-bound RTVs in descriptor order
     PreparedDraw::Attachment depth;
     PreparedDraw::Attachment stencil;
     bool depth_active = false;
     bool stencil_active = false;
-    std::vector<VkFormat> color_formats;  // by original OM slot; UNDEFINED for passive slots
+    std::vector<VkFormat> color_formats;  // one format per raster-bound RTV
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     VkExtent2D area{};
     std::uint32_t layers = 1;
@@ -2047,9 +2041,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const std::size_t color_slots = pass->color_formats->size();
         const std::size_t formats = pipeline->color_formats.size();
         if (color_slots > 32 || formats > 32) return ReplayResult::unsupported;
-        // The scope fixes the colour-attachment COUNT and every slot's format; the PSO's RTVFormats may have a
-        // different count. Build a variant that declares exactly the pass slots (padding missing RTVs and dropping
-        // extra ones with VK_FORMAT_UNDEFINED), so vkCmdDraw's 06179 count and 08910/08912 format rules both hold.
+        // The scope fixes the colour-attachment count and formats. Build a variant for the raster-bound RTVs
+        // when the PSO declares a different count or leaves a slot's format undefined (VUIDs 06179 and 08910).
         // A slot active in both with two different real formats is a genuine D3D12 mismatch and is refused.
         std::vector<VkFormat> colors(color_slots, VK_FORMAT_UNDEFINED);
         bool need_variant = color_slots != formats;
@@ -2220,9 +2213,8 @@ inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buf
 }
 
 // Resolves a BeginRenderPass's descriptors the same way prepare_draw resolves a draw's: the ResourceIds were
-// captured at record time, the bindings are looked up now. Original OM slot indices are preserved: a passive
-// NO_ACCESS slot keeps its index with a null view and VK_FORMAT_UNDEFINED (Vulkan 1.3 dynamic rendering leaves a
-// colour attachment with a null imageView unwritten). Formats are captured from the RTVs (D3D-41's color_view_format).
+// captured at record time, the bindings are looked up now. BeginRenderPass binds the raster RTVs consecutively
+// in descriptor order, skipping NO_ACCESS beginnings (DirectX-Specs, "Surfaces That BeginRenderPass Binds For Raster").
 // One DSV view serves both depth and stencil (Vulkan VUID 06085), but each plane's activity and aspect are separate.
 template<typename Resolve>
 ReplayResult prepare_render_pass(const BeginRenderPass& pass, Resolve&& resolve, const ReplayFunctions& vk,
@@ -2235,17 +2227,10 @@ ReplayResult prepare_render_pass(const BeginRenderPass& pass, Resolve&& resolve,
         view.area = {std::min(view.area.width, e.width), std::min(view.area.height, e.height)};
         layers = std::min(layers, range.layerCount);
     };
-    // Keep the original OM slot indices: dropping or compacting passive slots would shift shader output location k
-    // onto another attachment. The scope covers slots 0..highest-active; a passive slot stays a placeholder with a
-    // null view and VK_FORMAT_UNDEFINED. Trailing passive slots past the last active one need no attachment at all.
-    std::size_t color_slots = 0;
-    for (std::size_t slot = 0; slot < pass.colors.size(); ++slot)
-        if (pass.active_color_mask & (1u << slot)) color_slots = slot + 1;
-    view.colors.resize(color_slots);
-    view.color_formats.assign(color_slots, VK_FORMAT_UNDEFINED);
-    for (std::size_t slot = 0; slot < color_slots; ++slot) {
-        if (!(pass.active_color_mask & (1u << slot))) continue;  // passive: null view + UNDEFINED format
-        const RenderPassColor& color = pass.colors[slot];
+    view.colors.reserve(pass.colors.size());
+    view.color_formats.reserve(pass.colors.size());
+    for (const RenderPassColor& color : pass.colors) {
+        if (color.beginning.type == d3d12_render_beginning::no_access) continue;
         const ResourceBinding* binding = resolve(color.view.resource);
         if (!binding) return ReplayResult::unresolved_resource;
         PreparedDraw::Attachment a;
@@ -2265,8 +2250,8 @@ ReplayResult prepare_render_pass(const BeginRenderPass& pass, Resolve&& resolve,
         if (a.load == VK_ATTACHMENT_LOAD_OP_CLEAR)
             a.clear.color = render_target_clear_color(format, color.beginning.color);
         shrink(a.binding, color.view, a.range);
-        view.color_formats[slot] = format;
-        view.colors[slot] = std::move(a);
+        view.color_formats.push_back(format);
+        view.colors.push_back(std::move(a));
     }
     if (pass.depth_stencil) {
         const RenderPassDepthStencil& ds = *pass.depth_stencil;
@@ -3975,13 +3960,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
             constexpr VkPipelineStageFlags depth_stages =
                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-            // Every layout transition is issued here, before vkCmdBeginRendering (VUID 09553). A passive slot keeps
-            // a null image view: it is neither resolved nor transitioned, and Vulkan leaves it unwritten.
+            // Every layout transition is issued here, before vkCmdBeginRendering (VUID 09553).
             std::vector<VkRenderingAttachmentInfo> colors(prepared_pass.colors.size(),
                                                           {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
             for (std::size_t slot = 0; slot < prepared_pass.colors.size(); ++slot) {
-                auto& a = prepared_pass.colors[slot];
-                if (!a.view) continue;  // passive NO_ACCESS slot: keep the null image view
+                const auto& a = prepared_pass.colors[slot];
                 const VkImageLayout layout = image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                 detail::to_attachment(vk, command_buffer, a, layout, color_access,
                                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate);

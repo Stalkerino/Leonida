@@ -514,20 +514,11 @@ struct BeginRenderPass {
     std::vector<RenderPassColor> colors;
     std::optional<RenderPassDepthStencil> depth_stencil;
     std::uint32_t flags = 0;
-    // Captured at record time from the access types. A passive colour slot keeps its index in replay with a null
-    // image view; a plane is only attached when its access is active and its aspect is present.
-    std::uint32_t active_color_mask = 0;  // bit i: original RTV slot i is active
+    // Captured from the access types. Replay also checks which planes the DSV format provides.
     bool depth_active = false;
     bool stencil_active = false;
 };
 struct EndRenderPass {};
-
-// A colour slot with NO_ACCESS at both ends (no CLEAR, nothing stored) is passive: replay neither binds nor
-// transitions it, but keeps its index with a null view so shader output k still reaches attachment k.
-inline bool render_pass_color_active(std::uint32_t beginning, std::uint32_t ending) {
-    return beginning != d3d12_render_beginning::no_access ||
-           (ending != d3d12_render_ending::no_access && ending != d3d12_render_ending::discard);
-}
 
 // A plane is active when its beginning reads/clears it or its ending stores it. A beginning DISCARD is active and
 // maps to Vulkan DONT_CARE; it is never represented by dropping the attachment as if it were NO_ACCESS.
@@ -852,9 +843,6 @@ public:
             }
         }
         BeginRenderPass recorded = pass;
-        for (std::size_t slot = 0; slot < recorded.colors.size(); ++slot)
-            if (render_pass_color_active(recorded.colors[slot].beginning.type, recorded.colors[slot].ending.type))
-                recorded.active_color_mask |= 1u << slot;
         if (recorded.depth_stencil) {
             recorded.depth_active = render_pass_plane_active(recorded.depth_stencil->depth_beginning.type,
                                                              recorded.depth_stencil->depth_ending.type);

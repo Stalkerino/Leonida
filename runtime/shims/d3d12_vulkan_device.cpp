@@ -699,6 +699,12 @@ struct DeviceState {
         return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
     }
 
+    bool color_attachment_blend_usable(VkFormat format) const {
+        VkFormatProperties properties{};
+        format_properties(info.physical, format, &properties);
+        return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
+    }
+
     bool storage_usable(VkFormat format) const {
         VkFormatProperties properties{};
         format_properties(info.physical, format, &properties);
@@ -3384,14 +3390,17 @@ private:
         }
         multisample.pSampleMask = &r.sample_mask;
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
-        // VUID-VkGraphicsPipelineCreateInfo-renderPass-06055: the blend attachment count must equal the rendering
-        // colour-attachment count. VUID 06062: a slot the PSO did not declare, or whose format the pass reinterprets
-        // or leaves UNDEFINED, must not carry blendEnable=TRUE. The helper keeps only states whose format is the
-        // PSO's own and zeroes the rest.
-        const std::vector<VkPipelineColorBlendAttachmentState> blend_states =
-            leonida::variant_blend_states(r.blends, colors, graphics_.color_formats);
-        blend.attachmentCount = std::uint32_t(blend_states.size());
-        blend.pAttachments = blend_states.empty() ? nullptr : blend_states.data();
+        // The blend attachment count must equal the rendering colour-attachment count (VUID 06055).
+        const auto blend_states = leonida::variant_blend_states(
+            r.blends, colors, graphics_.color_formats, device_.info.features.independentBlend != VK_FALSE,
+            [this](VkFormat format) { return device_.color_attachment_blend_usable(format); });
+        if (!blend_states) {
+            log_once("a render-pass attachment cannot use the common blend state without independentBlend; colors",
+                     int(colors.size()));
+            return VK_NULL_HANDLE;
+        }
+        blend.attachmentCount = std::uint32_t(blend_states->size());
+        blend.pAttachments = blend_states->data();
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
         dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
         dynamic.pDynamicStates = dynamic_states;

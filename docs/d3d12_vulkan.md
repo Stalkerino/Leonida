@@ -2233,23 +2233,24 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   `ExecuteCommandLists` cannot change the submitted attachments. Replay opens one `vkCmdBeginRendering` scope over
   the captured RTVs/DSV and closes it at `EndRenderPass`. All layout transitions run **before** `BeginRendering`;
   a draw inside the scope reuses it, takes its attachments and formats from the pass snapshot (not the stale OM
-  bindings, VUID 08910) and emits no barrier inside the scope (VUID 09553). Colour slots keep their **original OM
-  index**: a NO_ACCESS/NO_ACCESS slot is not resolved or transitioned but stays in the scope with a
-  `VK_NULL_HANDLE` image view (Vulkan 1.3 dynamic rendering leaves such an attachment unwritten) and an UNDEFINED
-  pipeline format, so shader output `SV_Target k` still reaches attachment `k`. `colorAttachmentCount` covers
-  slots 0 through the highest active slot; no passive slot is ever dropped or compacted. A draw in the scope binds a
-  pipeline variant whose `VkPipelineRenderingCreateInfo::colorAttachmentCount` is the **pass** slot count, padding
-  missing PSO RTVs and dropping extra ones with UNDEFINED formats (VUID 06179). Padded and pass-reinterpreted slots
-  disable blending, since their format may lack `VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT` (VUID 06062);
-  fragment writes to output locations above the pass count are discarded as on D3D12, but core Vulkan only guarantees
-  that for null-view padding slots. A two-plane PSO DSV used by a single-plane pass keeps its format on the active
+  bindings, VUID 08910) and emits no barrier inside the scope (VUID 09553).
+  [D3D12 raster binding](https://microsoft.github.io/DirectX-Specs/d3d/RenderPasses.html#surfaces-that-beginrenderpass-binds-for-raster)
+  assigns RTV slots consecutively in descriptor order. A NO_ACCESS beginning excludes that RTV from the raster
+  bindings and replay skips its view and layout transition. `SV_Target0` therefore reaches the first raster-bound
+  RTV. The Vulkan scope and pipeline both declare the raster-bound RTV count (VUID 06179). A variant trims excess
+  PSO formats or fills missing and undefined formats from the pass. Vulkan requires matching blend attachment
+  states without `independentBlend` (VUID 00605), including any undefined-format slots in a variant. VUID 06062
+  applies to real formats. If a newly used format lacks `VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT` and the
+  inherited state enables blending, replay disables it for that slot with `independentBlend` or refuses the draw
+  when the feature is unavailable. The unbound-RTV variant outside a pass uses the original PSO blend array.
+  A two-plane PSO DSV used by a single-plane pass keeps its format on the active
   plane and sets the other plane UNDEFINED; a pass with depth/stencil testing enabled but that plane inactive runs
   with defined behaviour (reading a NO_ACCESS plane is undefined on D3D12 too). The pass path requires the pass and
   PSO depth formats to match exactly; typeless reinterpretation is not supported here. Beginning
   CLEAR/PRESERVE/DISCARD/NO_ACCESS map to `CLEAR`/`LOAD`/`DONT_CARE`/`DONT_CARE`, ending
   PRESERVE/DISCARD/NO_ACCESS to `STORE`/`STORE_OP_NONE`/`STORE_OP_NONE`; `VK_ATTACHMENT_STORE_OP_NONE` is defined in
   Vulkan 1.3 with the `VK_KHR_dynamic_rendering` promotion (not `VK_KHR_load_store_op_none`), so no extension is
-  enabled for it. A beginning NO_ACCESS
+  enabled for it. For an attached DSV plane, a beginning NO_ACCESS
   is a deliberate conservative choice: core Vulkan 1.3 has no "do not load" op (`VK_ATTACHMENT_LOAD_OP_NONE` needs
   `VK_KHR_load_store_op_none`), so it is DONT_CARE, never LOAD or CLEAR. Depth and stencil have independent activity
   flags and aspect masks but share one DSV view when both are active (VUID 06085); D24 clears are quantised as

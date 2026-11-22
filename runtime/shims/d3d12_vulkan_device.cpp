@@ -3162,9 +3162,16 @@ public:
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
-        graphics_.pipeline = build(0);
+        graphics_.pipeline = build(default_attachments());
         if (!graphics_.pipeline) return E_FAIL;
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
+        graphics_.variant_attachments = [this](const std::vector<VkFormat>& colors, VkFormat depth, VkFormat stencil) {
+            AttachmentFormats a;
+            a.colors = colors;
+            a.depth = depth;
+            a.stencil = stencil;
+            return variant_attachments(a);
+        };
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -3310,8 +3317,30 @@ private:
         VkPipelineColorBlendStateCreateInfo blend{};
     };
 
-    // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
-    VkPipeline build(std::uint32_t unbound) const {
+    // The exact attachment formats a variant declares: colour-slot count, each slot's format and the two depth/stencil
+    // plane formats. UNDEFINED means "no attachment" (core Vulkan 1.3); the count is `colors.size()`.
+    struct AttachmentFormats {
+        std::vector<VkFormat> colors;
+        VkFormat depth = VK_FORMAT_UNDEFINED;
+        VkFormat stencil = VK_FORMAT_UNDEFINED;
+        bool operator<(const AttachmentFormats& o) const {
+            if (colors != o.colors) return colors < o.colors;
+            if (depth != o.depth) return depth < o.depth;
+            return stencil < o.stencil;
+        }
+    };
+
+    AttachmentFormats default_attachments() const {
+        AttachmentFormats a;
+        a.colors = graphics_.color_formats;
+        if (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) a.depth = graphics_.depth_format;
+        if (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) a.stencil = graphics_.depth_format;
+        return a;
+    }
+
+    // Build a pipeline whose rendering info declares exactly `a` — no aspect inference here; the caller decided which
+    // slots and planes are active, so a render-pass draw's VkRenderingInfo and the pipeline agree (VUID 06179).
+    VkPipeline build(const AttachmentFormats& a) const {
         // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
         // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
         // (VUID-vkCmdDraw-pStrides-04913).
@@ -3321,17 +3350,12 @@ private:
             VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
             VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
         const Recipe& r = recipe_;
-        std::vector<VkFormat> colors = graphics_.color_formats;
-        for (std::size_t slot = 0; slot < colors.size(); ++slot)
-            if (unbound & (1u << slot)) colors[slot] = VK_FORMAT_UNDEFINED;
-        const bool depth_bound = !(unbound & leonida::GraphicsPipeline::unbound_depth);
+        const std::vector<VkFormat>& colors = a.colors;
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         rendering.colorAttachmentCount = std::uint32_t(colors.size());
         rendering.pColorAttachmentFormats = colors.data();
-        if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
-            rendering.depthAttachmentFormat = graphics_.depth_format;
-        if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
-            rendering.stencilAttachmentFormat = graphics_.depth_format;
+        rendering.depthAttachmentFormat = a.depth;
+        rendering.stencilAttachmentFormat = a.stencil;
 
         VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         VkPipelineVertexInputDivisorStateCreateInfoEXT divisor_state{
@@ -3360,8 +3384,28 @@ private:
         }
         multisample.pSampleMask = &r.sample_mask;
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
-        blend.attachmentCount = std::uint32_t(r.blends.size());
-        blend.pAttachments = r.blends.data();
+        // VUID-VkGraphicsPipelineCreateInfo-renderPass-06055: with dynamic rendering, the blend attachment count must
+        // equal the rendering colour-attachment count. A count-changing variant therefore takes the first `colors`
+        // blend states (or neutral ones for slots the PSO never declared).
+        std::vector<VkPipelineColorBlendAttachmentState> blend_states;
+        blend_states.reserve(colors.size());
+        for (std::size_t slot = 0; slot < colors.size(); ++slot) {
+            if (slot < r.blends.size()) {
+                blend_states.push_back(r.blends[slot]);
+            } else {
+                // Replicate slot 0 (without independentBlend all entries must be identical, VUID 00605).
+                VkPipelineColorBlendAttachmentState neutral{};
+                if (!r.blends.empty()) {
+                    neutral = r.blends[0];
+                } else {
+                    neutral.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+                }
+                blend_states.push_back(neutral);
+            }
+        }
+        blend.attachmentCount = std::uint32_t(blend_states.size());
+        blend.pAttachments = blend_states.empty() ? nullptr : blend_states.data();
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
         dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
         dynamic.pDynamicStates = dynamic_states;
@@ -3386,16 +3430,25 @@ private:
     }
 
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
-    VkPipeline variant(std::uint32_t unbound) {
+    VkPipeline variant_attachments(const AttachmentFormats& a) {
         std::lock_guard lock(variants_mutex_);
-        if (const auto it = variants_.find(unbound); it != variants_.end()) return it->second;
-        const VkPipeline pipeline = build(unbound);
+        if (const auto it = variants_.find(a); it != variants_.end()) return it->second;
+        const VkPipeline pipeline = build(a);
         if (!pipeline) {
-            log_once("a pipeline variant for unbound attachment slots could not be built; slots", int(unbound));
+            log_once("a pipeline variant for render-pass attachment formats could not be built; colors",
+                     int(a.colors.size()));
             return VK_NULL_HANDLE;
         }
-        variants_.emplace(unbound, pipeline);
+        variants_.emplace(a, pipeline);
         return pipeline;
+    }
+
+    VkPipeline variant(std::uint32_t unbound) {
+        AttachmentFormats a = default_attachments();
+        for (std::size_t slot = 0; slot < a.colors.size(); ++slot)
+            if (unbound & (1u << slot)) a.colors[slot] = VK_FORMAT_UNDEFINED;
+        if (unbound & leonida::GraphicsPipeline::unbound_depth) a.depth = a.stencil = VK_FORMAT_UNDEFINED;
+        return variant_attachments(a);
     }
 
     DeviceState& device_;
@@ -3403,7 +3456,7 @@ private:
     leonida::GraphicsPipeline graphics_;
     Recipe recipe_;
     std::mutex variants_mutex_;
-    std::map<std::uint32_t, VkPipeline> variants_;
+    std::map<AttachmentFormats, VkPipeline> variants_;
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::vector<VkShaderModule> modules_;
     VkDeviceSize code_base_ = 0;

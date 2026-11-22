@@ -761,6 +761,11 @@ struct GraphicsPipeline {
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
+    // The same pipeline built for a draw inside a rendering scope: the pass fixes both the colour-attachment COUNT
+    // and every slot's format (VUID-vkCmdDraw-colorAttachmentCount-06179 and 08910/08912), and may leave one
+    // depth/stencil plane inactive. UNDEFINED entries mean "no attachment" in core Vulkan 1.3. Null if unavailable.
+    std::function<VkPipeline(const std::vector<VkFormat>& colors, VkFormat depth, VkFormat stencil)>
+        variant_attachments;
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -2015,31 +2020,41 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
 
     if (pass) {
         const std::size_t color_slots = pass->color_formats->size();
-        // The pipeline and the rendering scope must agree on every colour format, at the ORIGINAL slot index.
-        // An active slot must match. A passive slot (UNDEFINED in the pass) or a slot past the scope discards its
-        // shader output in D3D12, so `variant` turns that pipeline format UNDEFINED to match the null attachment
-        // (VUID 08910). A real mismatch is refused, never silently replayed with the wrong attachment.
         const std::size_t formats = pipeline->color_formats.size();
         if (color_slots > 32 || formats > 32) return ReplayResult::unsupported;
-        std::uint32_t unbound = 0;
-        for (std::size_t slot = 0; slot < formats; ++slot) {
-            const VkFormat pass_format = slot < color_slots ? (*pass->color_formats)[slot] : VK_FORMAT_UNDEFINED;
-            const VkFormat pipe_format = pipeline->color_formats[slot];
-            if (pass_format == VK_FORMAT_UNDEFINED) {
-                if (pipe_format != VK_FORMAT_UNDEFINED) unbound |= 1u << slot;
-            } else if (pipe_format != pass_format) {
+        // The scope fixes the colour-attachment COUNT and every slot's format; the PSO's RTVFormats may have a
+        // different count. Build a variant that declares exactly the pass slots (padding missing RTVs and dropping
+        // extra ones with VK_FORMAT_UNDEFINED), so vkCmdDraw's 06179 count and 08910/08912 format rules both hold.
+        // A slot active in both with two different real formats is a genuine D3D12 mismatch and is refused.
+        std::vector<VkFormat> colors(color_slots, VK_FORMAT_UNDEFINED);
+        bool need_variant = color_slots != formats;
+        for (std::size_t slot = 0; slot < color_slots; ++slot) {
+            const VkFormat pass_format = (*pass->color_formats)[slot];
+            const VkFormat pipe_format = slot < formats ? pipeline->color_formats[slot] : VK_FORMAT_UNDEFINED;
+            if (pass_format != VK_FORMAT_UNDEFINED && pipe_format != VK_FORMAT_UNDEFINED &&
+                pipe_format != pass_format)
                 return ReplayResult::unsupported;
-            }
+            colors[slot] = pass_format;
+            if (pipe_format != pass_format) need_variant = true;
         }
+        // The pass may use only one plane of a two-plane PSO (e.g. a D24S8 DSV with NO_ACCESS stencil). Keep the
+        // shared format on the active plane(s) and make the inactive plane UNDEFINED in the variant (08913/08914).
+        VkFormat depth = VK_FORMAT_UNDEFINED, stencil = VK_FORMAT_UNDEFINED;
         if (pass->depth_aspects) {
             if (pipeline->depth_format == VK_FORMAT_UNDEFINED || pipeline->depth_format != pass->depth_format ||
-                ((pipeline->depth_aspects ^ pass->depth_aspects) & depth_stencil_aspects))
+                ((pass->depth_aspects & ~pipeline->depth_aspects) & depth_stencil_aspects))
                 return ReplayResult::unsupported;
-        } else if (pipeline->depth_format != VK_FORMAT_UNDEFINED) {
-            unbound |= GraphicsPipeline::unbound_depth;
+            if (pass->depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) depth = pipeline->depth_format;
+            if (pass->depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) stencil = pipeline->depth_format;
         }
-        if (unbound) {
-            p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
+        const VkFormat base_depth =
+            (pipeline->depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? pipeline->depth_format : VK_FORMAT_UNDEFINED;
+        const VkFormat base_stencil =
+            (pipeline->depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? pipeline->depth_format : VK_FORMAT_UNDEFINED;
+        if (depth != base_depth || stencil != base_stencil) need_variant = true;
+        if (need_variant) {
+            p.pipeline = pipeline->variant_attachments ? pipeline->variant_attachments(colors, depth, stencil)
+                                                       : VK_NULL_HANDLE;
             if (!p.pipeline) return ReplayResult::unsupported;
         }
     } else {

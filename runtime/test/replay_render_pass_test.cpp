@@ -116,6 +116,8 @@ const leonida::ResourceBinding color2 = [] {
 const leonida::ResourceBinding depth_stencil =
     binding(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 const leonida::ResourceBinding depth_only = binding(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
+const leonida::ResourceBinding d24s8 =
+    binding(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 // The graphics pipeline used by the draw-in-a-pass tests. Its colour formats match the captured RTVs.
 leonida::GraphicsPipeline graphics;
 leonida::GraphicsPipeline* current_pipeline = nullptr;
@@ -125,7 +127,23 @@ const leonida::ResourceBinding* resolve(leonida::ResourceId id) {
     if (id == 2) return &depth_stencil;
     if (id == 3) return &depth_only;
     if (id == 4) return &color2;
+    if (id == 5) return &d24s8;
     return nullptr;
+}
+
+// The pipeline variant a pass draw requests: its colour vector is the pipeline's VkRenderingCreateInfo count and
+// formats (VUID 06179), and depth/stencil are the two plane formats directly.
+std::vector<VkFormat> variant_colors;
+VkFormat variant_depth = VK_FORMAT_UNDEFINED, variant_stencil = VK_FORMAT_UNDEFINED;
+int variant_calls = 0;
+void attach_variant(leonida::GraphicsPipeline& g, VkPipeline result) {
+    g.variant_attachments = [result](const std::vector<VkFormat>& colors, VkFormat depth, VkFormat stencil) {
+        variant_colors = colors;
+        variant_depth = depth;
+        variant_stencil = stencil;
+        ++variant_calls;
+        return result;
+    };
 }
 
 leonida::ReplayFunctions functions() {
@@ -183,6 +201,7 @@ int main() {
     graphics.layout = reinterpret_cast<VkPipelineLayout>(std::uintptr_t{11});
     graphics.color_formats = {VK_FORMAT_R8G8B8A8_UNORM};
     graphics.variant = [](std::uint32_t) { return reinterpret_cast<VkPipeline>(std::uintptr_t{12}); };
+    attach_variant(graphics, reinterpret_cast<VkPipeline>(std::uintptr_t{12}));
     const auto vk = functions();
 
     // PRESERVE at both ends is a LOAD/STORE scope over the captured RTV.
@@ -328,22 +347,106 @@ int main() {
     // report an unsupported format mismatch here (slot 1 would compare RGBA16F against RGBA8).
     leonida::GraphicsPipeline three = graphics;
     three.color_formats = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_UNORM};
-    std::uint32_t variant_mask = 0;
-    three.variant = [&variant_mask](std::uint32_t m) {
-        variant_mask = m;
-        return reinterpret_cast<VkPipeline>(std::uintptr_t{13});
-    };
+    const VkPipeline three_variant = reinterpret_cast<VkPipeline>(std::uintptr_t{13});
+    attach_variant(three, three_variant);
     leonida::CommandList spaced_draw;
     expect(spaced_draw.begin_render_pass(spaced) && spaced_draw.draw(draw) && spaced_draw.end_render_pass() &&
                spaced_draw.close(),
            "record a draw in a pass with an interior passive slot");
     current_pipeline = &three;
+    variant_calls = 0;
     const ReplayResult spaced_result = run(spaced_draw, vk);
     current_pipeline = &graphics;
     expect(spaced_result == ReplayResult::success, "pass-draw format matching keeps original slot indices");
-    expect(variant_mask == (1u << 1), "only the passive slot gets an UNDEFINED pipeline format");
-    expect(seen.draws == 1 && seen.bound == reinterpret_cast<VkPipeline>(std::uintptr_t{13}),
-           "the draw binds the slot-preserving variant");
+    expect(variant_calls == 1 && variant_colors.size() == 3 && variant_colors[0] == VK_FORMAT_R8G8B8A8_UNORM &&
+               variant_colors[1] == VK_FORMAT_UNDEFINED && variant_colors[2] == VK_FORMAT_R16G16B16A16_UNORM,
+           "only the passive slot gets an UNDEFINED pipeline format, at its original index");
+    expect(seen.draws == 1 && seen.bound == three_variant, "the draw binds the slot-preserving variant");
+
+    // BLOCKER (VUID-vkCmdDraw-colorAttachmentCount-06179): the PSO's RTV count and the pass's slot count are
+    // independent in D3D12. Both directions must yield a pipeline whose count equals the pass, not a silent invalid
+    // draw. The captured variant colour vector IS the pipeline's rendering count in this mock.
+    // (a) PSO 1 RTV inside a 3-slot pass: pad the passive slot and the extra active slot by slot format.
+    leonida::GraphicsPipeline one_rtv = graphics;
+    one_rtv.color_formats = {VK_FORMAT_R8G8B8A8_UNORM};
+    const VkPipeline one_variant = reinterpret_cast<VkPipeline>(std::uintptr_t{14});
+    attach_variant(one_rtv, one_variant);
+    leonida::CommandList one_in_three;
+    expect(one_in_three.begin_render_pass(spaced) && one_in_three.draw(draw) && one_in_three.end_render_pass() &&
+               one_in_three.close(),
+           "record a 1-RTV PSO draw in a 3-slot pass");
+    current_pipeline = &one_rtv;
+    variant_calls = 0;
+    const ReplayResult one_result = run(one_in_three, vk);
+    current_pipeline = &graphics;
+    expect(one_result == ReplayResult::success, "a 1-RTV PSO in a 3-slot pass is replayed, not refused");
+    expect(variant_calls == 1 && variant_colors.size() == 3 && variant_colors[0] == VK_FORMAT_R8G8B8A8_UNORM &&
+               variant_colors[1] == VK_FORMAT_UNDEFINED && variant_colors[2] == VK_FORMAT_R16G16B16A16_UNORM,
+           "the pipeline declares 3 colour attachments, matching the pass count (VUID 06179)");
+    expect(seen.bound == one_variant, "the draw binds the count-matched variant");
+
+    // (b) PSO 3 RTVs inside a 1-slot pass: drop the extra RTVs so the pipeline declares one colour attachment.
+    leonida::GraphicsPipeline three_in_one = graphics;
+    three_in_one.color_formats = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_UNORM};
+    const VkPipeline truncated = reinterpret_cast<VkPipeline>(std::uintptr_t{15});
+    attach_variant(three_in_one, truncated);
+    leonida::CommandList three_list;
+    expect(three_list.begin_render_pass(pass()) && three_list.draw(draw) && three_list.end_render_pass() &&
+               three_list.close(),
+           "record a 3-RTV PSO draw in a 1-slot pass");
+    current_pipeline = &three_in_one;
+    variant_calls = 0;
+    variant_colors.clear();
+    const ReplayResult three_result = run(three_list, vk);
+    current_pipeline = &graphics;
+    expect(three_result == ReplayResult::success, "a 3-RTV PSO in a 1-slot pass is replayed, not refused");
+    expect(variant_calls == 1 && variant_colors.size() == 1 && variant_colors[0] == VK_FORMAT_R8G8B8A8_UNORM,
+           "the pipeline declares 1 colour attachment, matching the pass count (VUID 06179)");
+    expect(seen.bound == truncated, "the draw binds the truncated variant");
+
+    // A genuine format clash at an active slot (both real but different) is still refused before emit.
+    leonida::GraphicsPipeline wrong = graphics;
+    wrong.color_formats = {VK_FORMAT_R16G16B16A16_UNORM};  // pass slot 0 is RGBA8
+    leonida::CommandList mismatch;
+    expect(mismatch.begin_render_pass(pass()) && mismatch.draw(draw) && mismatch.end_render_pass() && mismatch.close(),
+           "record a draw whose PSO format clashes with the pass");
+    current_pipeline = &wrong;
+    variant_calls = 0;
+    const ReplayResult mismatch_result = run(mismatch, vk);
+    current_pipeline = &graphics;
+    expect(mismatch_result == ReplayResult::unsupported && seen.begins == 0 && variant_calls == 0,
+           "a real active-slot format mismatch is refused before any command is emitted");
+
+    // RISK-1: a D24S8 DSV with a NO_ACCESS stencil plane and a two-plane D24S8 PSO is the canonical depth-only pass.
+    // The pass declares only DEPTH; the variant keeps D24S8 on depth and makes stencil UNDEFINED.
+    leonida::GraphicsPipeline dsv = graphics;
+    dsv.depth_format = VK_FORMAT_D24_UNORM_S8_UINT;
+    dsv.depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    const VkPipeline dsv_variant = reinterpret_cast<VkPipeline>(std::uintptr_t{16});
+    attach_variant(dsv, dsv_variant);
+    leonida::BeginRenderPass depth_only_pass = pass(B::clear, E::preserve);
+    leonida::RenderPassDepthStencil only_depth{};
+    only_depth.view = leonida::TargetView{5, 0, 0, 1};
+    only_depth.depth_beginning.type = B::clear;
+    only_depth.depth_beginning.depth = 0.5f;
+    only_depth.depth_ending.type = E::preserve;
+    only_depth.stencil_beginning.type = B::no_access;
+    only_depth.stencil_ending.type = E::no_access;
+    depth_only_pass.depth_stencil = only_depth;
+    leonida::CommandList dsv_list;
+    expect(dsv_list.begin_render_pass(depth_only_pass) && dsv_list.draw(draw) && dsv_list.end_render_pass() &&
+               dsv_list.close(),
+           "record a D24S8 depth-only pass with a two-plane PSO");
+    current_pipeline = &dsv;
+    variant_calls = 0;
+    const ReplayResult dsv_result = run(dsv_list, vk);
+    current_pipeline = &graphics;
+    expect(dsv_result == ReplayResult::success, "the canonical D24S8 + NO_ACCESS stencil pattern is supported");
+    expect(variant_calls == 1 && variant_depth == VK_FORMAT_D24_UNORM_S8_UINT &&
+               variant_stencil == VK_FORMAT_UNDEFINED,
+           "the variant keeps D24S8 depth and drops the inactive stencil plane");
+    expect(seen.depth && !seen.stencil && seen.bound == dsv_variant,
+           "only the depth plane is attached and the variant is bound");
 
     // Commands Vulkan forbids inside a rendering scope are refused in prepare, before any command buffer is touched.
     leonida::CommandList bad_dispatch;

@@ -2237,10 +2237,14 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   index**: a NO_ACCESS/NO_ACCESS slot is not resolved or transitioned but stays in the scope with a
   `VK_NULL_HANDLE` image view (Vulkan 1.3 dynamic rendering leaves such an attachment unwritten) and an UNDEFINED
   pipeline format, so shader output `SV_Target k` still reaches attachment `k`. `colorAttachmentCount` covers
-  slots 0 through the highest active slot; no passive slot is ever dropped or compacted. Beginning
+  slots 0 through the highest active slot; no passive slot is ever dropped or compacted. A draw in the scope binds a
+  pipeline variant whose `VkPipelineRenderingCreateInfo::colorAttachmentCount` is the **pass** slot count, padding
+  missing PSO RTVs and dropping extra ones with UNDEFINED formats (VUID 06179); a two-plane PSO DSV used by a
+  single-plane pass keeps its format on the active plane and sets the other plane UNDEFINED. Beginning
   CLEAR/PRESERVE/DISCARD/NO_ACCESS map to `CLEAR`/`LOAD`/`DONT_CARE`/`DONT_CARE`, ending
-  PRESERVE/DISCARD/NO_ACCESS to `STORE`/`STORE_OP_NONE`/`STORE_OP_NONE`; `VK_ATTACHMENT_STORE_OP_NONE` is core in
-  Vulkan 1.3 (promoted from `VK_KHR_load_store_op_none`), so no extension is enabled for it. A beginning NO_ACCESS
+  PRESERVE/DISCARD/NO_ACCESS to `STORE`/`STORE_OP_NONE`/`STORE_OP_NONE`; `VK_ATTACHMENT_STORE_OP_NONE` is defined in
+  Vulkan 1.3 with the `VK_KHR_dynamic_rendering` promotion (not `VK_KHR_load_store_op_none`), so no extension is
+  enabled for it. A beginning NO_ACCESS
   is a deliberate conservative choice: core Vulkan 1.3 has no "do not load" op (`VK_ATTACHMENT_LOAD_OP_NONE` needs
   `VK_KHR_load_store_op_none`), so it is DONT_CARE, never LOAD or CLEAR. Depth and stencil have independent activity
   flags and aspect masks but share one DSV view when both are active (VUID 06085); D24 clears are quantised as

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -72,6 +73,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_query: return "invalid query";
     case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument or count buffer range";
     case leonida::ReplayResult::unsupported: return "unsupported";
+    case leonida::ReplayResult::invalid_render_pass: return "unbalanced render pass";
     }
     return "?";
 }
@@ -178,6 +180,7 @@ public:
     }
 
     const leonida::CommandList& commands() const { return list_; }
+    bool render_pass_close_failed() const { return render_pass_close_failed_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
     UINT back_stencil_ref() const { return back_stencil_ref_; }
 
@@ -191,7 +194,8 @@ public:
     // reports it.
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
-        if (list_.queries_open()) invalid_ = true;
+        if (list_.render_pass_open()) render_pass_close_failed_ = true;
+        if (list_.queries_open() || list_.render_pass_open()) invalid_ = true;
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         stop_recording();
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
@@ -205,6 +209,10 @@ public:
         // Another list recording into the allocator: E_INVALIDARG, as on the PC runtime (D3D-51).
         if (command_allocator->recording() && command_allocator->recording() != this)
             return d3d12_trace::result(method, E_INVALIDARG);
+        // The unclosed-pass Close error is persisted and surfaced again by Reset (same HRESULT). The error is then
+        // cleared so the list stays reusable; other invalid calls keep D3D12's Reset == S_OK behaviour.
+        const bool render_pass_error = render_pass_close_failed_;
+        render_pass_close_failed_ = false;
         if (!list_.reset()) return d3d12_trace::result(method, E_FAIL);  // D3D12 resets only closed lists
         record_into(command_allocator);
         invalid_ = false;
@@ -212,7 +220,7 @@ public:
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) set_initial_pipeline(state);  // reset_state holds it
-        return d3d12_trace::result(method, S_OK);
+        return d3d12_trace::result(method, render_pass_error ? E_INVALIDARG : S_OK);
     }
 
     // CreateCommandList's pipeline state. As SetPipelineState on a direct list; on a bundle it is the first deferred
@@ -572,6 +580,79 @@ public:
         if (!view.ptr) return check(false);
         check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(view.ptr), u(flags), depth,
                                         stencil, to_rects(count, rects)));
+    }
+
+    // GCL4 render pass. The CPU descriptor slots are consumed now (as Clear*View does): the IR copies each TargetView
+    // by value, so a later rewrite of a slot cannot change what a submitted list renders. Values are validated
+    // against the public d3d12.h enum values; unsupported ending accesses (RESOLVE, LOCAL) are refused.
+    static std::optional<leonida::RenderPassAccess> render_access(const D3D12_RENDER_PASS_BEGINNING_ACCESS& in) {
+        if (in.Type > D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS) return std::nullopt;
+        leonida::RenderPassAccess out{};
+        out.type = u(in.Type);
+        if (in.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR) {
+            out.color = {in.Clear.ClearValue.Color[0], in.Clear.ClearValue.Color[1], in.Clear.ClearValue.Color[2],
+                         in.Clear.ClearValue.Color[3]};
+            out.depth = in.Clear.ClearValue.DepthStencil.Depth;
+            out.stencil = in.Clear.ClearValue.DepthStencil.Stencil;
+        }
+        return out;
+    }
+
+    static std::optional<leonida::RenderPassAccess> render_access(const D3D12_RENDER_PASS_ENDING_ACCESS& in) {
+        if (in.Type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD &&
+            in.Type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE &&
+            in.Type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_NO_ACCESS)
+            return std::nullopt;  // RESOLVE and the LOCAL types have no safe replay here
+        leonida::RenderPassAccess out{};
+        out.type = u(in.Type);
+        return out;
+    }
+
+    void STDMETHODCALLTYPE BeginRenderPass(UINT NumRenderTargets,
+                                            const D3D12_RENDER_PASS_RENDER_TARGET_DESC* pRenderTargets,
+                                            const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* pDepthStencil,
+                                            D3D12_RENDER_PASS_FLAGS Flags) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList4::BeginRenderPass");
+        // No flag is supported: SUSPENDING/RESUMING are not emulated and are refused, not replayed as a normal pass.
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || list_.render_pass_open() || u(Flags) != 0 ||
+            NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT || (NumRenderTargets && !pRenderTargets))
+            return check(false);
+        leonida::BeginRenderPass pass{};
+        pass.flags = u(Flags);
+        for (UINT i = 0; i < NumRenderTargets; ++i) {
+            const auto& d = pRenderTargets[i];
+            if (!d.cpuDescriptor.ptr) return check(false);
+            const auto beginning = render_access(d.BeginningAccess);
+            const auto ending = render_access(d.EndingAccess);
+            if (!beginning || !ending) return check(false);
+            leonida::RenderPassColor color{};
+            color.view = *reinterpret_cast<const leonida::TargetView*>(d.cpuDescriptor.ptr);
+            color.beginning = *beginning;
+            color.ending = *ending;
+            pass.colors.push_back(color);
+        }
+        if (pDepthStencil) {
+            if (!pDepthStencil->cpuDescriptor.ptr) return check(false);
+            const auto db = render_access(pDepthStencil->DepthBeginningAccess);
+            const auto sb = render_access(pDepthStencil->StencilBeginningAccess);
+            const auto de = render_access(pDepthStencil->DepthEndingAccess);
+            const auto se = render_access(pDepthStencil->StencilEndingAccess);
+            if (!db || !sb || !de || !se) return check(false);
+            leonida::RenderPassDepthStencil ds{};
+            ds.view = *reinterpret_cast<const leonida::TargetView*>(pDepthStencil->cpuDescriptor.ptr);
+            ds.depth_beginning = *db;
+            ds.stencil_beginning = *sb;
+            ds.depth_ending = *de;
+            ds.stencil_ending = *se;
+            pass.depth_stencil = ds;
+        }
+        check(list_.begin_render_pass(pass));
+    }
+
+    void STDMETHODCALLTYPE EndRenderPass() override {
+        d3d12_trace::record("ID3D12GraphicsCommandList4::EndRenderPass");
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
+        check(list_.end_render_pass());
     }
 
     // A null region discards the whole resource. Not allowed in a bundle.
@@ -977,6 +1058,7 @@ private:
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
+    bool render_pass_close_failed_ = false;  // an unclosed pass makes both Close and the following Reset fail
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
     RootState compute_;
@@ -1253,6 +1335,13 @@ public:
             if (!list || list->type() == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
                 std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u is not a direct command list\n", i);
                 last_result_ = leonida::ReplayResult::unsupported;
+                d3d12_trace::record(method, "failed");
+                return;
+            }
+            // A list whose Close failed on an open render pass is refused before any batch is prepared or emitted.
+            if (list->render_pass_close_failed() || list->commands().render_pass_open()) {
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u has an unbalanced render pass\n", i);
+                last_result_ = leonida::ReplayResult::invalid_render_pass;
                 d3d12_trace::record(method, "failed");
                 return;
             }

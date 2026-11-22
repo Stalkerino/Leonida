@@ -2256,6 +2256,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_clear_gate_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_clear_gate COMMAND replay_clear_gate_test)
+    # BeginRenderPass/EndRenderPass record+replay with a synthetic VkRenderingInfo capture (no GPU or game data).
+    add_executable(replay_render_pass_test test/replay_render_pass_test.cpp)
+    target_link_libraries(replay_render_pass_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_render_pass_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_render_pass COMMAND replay_render_pass_test)
     # WriteBufferImmediate suspends conditional rendering around vkCmdUpdateBuffer so Intel drivers do not drop it.
     add_executable(replay_write_immediate_predication_test test/replay_write_immediate_predication_test.cpp)
     target_link_libraries(replay_write_immediate_predication_test PRIVATE Vulkan::Headers)

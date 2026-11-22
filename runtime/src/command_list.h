@@ -152,6 +152,34 @@ inline constexpr std::uint32_t clear_depth = 0x1;
 inline constexpr std::uint32_t clear_stencil = 0x2;
 inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
+// D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE / ..._ENDING_ACCESS_TYPE (public d3d12.h).
+namespace d3d12_render_beginning {
+inline constexpr std::uint32_t discard = 0;
+inline constexpr std::uint32_t preserve = 1;
+inline constexpr std::uint32_t clear = 2;
+inline constexpr std::uint32_t no_access = 3;
+} // namespace d3d12_render_beginning
+
+namespace d3d12_render_ending {
+inline constexpr std::uint32_t discard = 0;
+inline constexpr std::uint32_t preserve = 1;
+inline constexpr std::uint32_t resolve = 2;
+inline constexpr std::uint32_t no_access = 3;
+} // namespace d3d12_render_ending
+
+// D3D12_RENDER_PASS_FLAGS. No flag is accepted: SUSPENDING/RESUMING describe tile-memory suspend/resume, which has
+// no Vulkan dynamic-rendering equivalent and is not emulated here; UAV writes, read-only bindings and the LOCAL
+// access types need semantics this layer does not have (docs/d3d12_vulkan.md section 4.3). Every nonzero flag is
+// refused at record time and reported as a future gap, never replayed as an ordinary pass.
+namespace d3d12_render_pass_flag {
+inline constexpr std::uint32_t allow_uav_writes = 0x1;
+inline constexpr std::uint32_t suspending = 0x2;
+inline constexpr std::uint32_t resuming = 0x4;
+inline constexpr std::uint32_t bind_read_only_depth = 0x8;
+inline constexpr std::uint32_t bind_read_only_stencil = 0x10;
+inline constexpr std::uint32_t supported = 0;
+} // namespace d3d12_render_pass_flag
+
 // The format a color view names, as a VkFormat number (0, `resource`, is the resource's own). The named values are
 // the RGBA8 family's; a typeless resource of any other family stores its view's VkFormat the same way (D3D-275).
 enum class ColorViewFormat : std::uint32_t {
@@ -456,6 +484,57 @@ struct ClearDepthStencil {
     std::vector<Rect> rects;
 };
 
+// One beginning or ending access of a render-pass attachment, captured by value at BeginRenderPass. `type` is a
+// d3d12_render_beginning or d3d12_render_ending value; the clear fields are read only for a CLEAR access.
+struct RenderPassAccess {
+    std::uint32_t type = 0;
+    ClearColor color{};
+    float depth = 0.0f;
+    std::uint8_t stencil = 0;
+};
+
+// The CPU descriptor is copied into `view` while BeginRenderPass is recorded, not at execution (D3D12 reads it at
+// the call). Ending RESOLVE and the LOCAL access types are refused: the replay has no resolve-attachment path yet.
+struct RenderPassColor {
+    TargetView view;
+    RenderPassAccess beginning;
+    RenderPassAccess ending;
+};
+
+// Depth and stencil are one image view but have independent accesses, as in D3D12.
+struct RenderPassDepthStencil {
+    TargetView view;
+    RenderPassAccess depth_beginning;
+    RenderPassAccess stencil_beginning;
+    RenderPassAccess depth_ending;
+    RenderPassAccess stencil_ending;
+};
+
+struct BeginRenderPass {
+    std::vector<RenderPassColor> colors;
+    std::optional<RenderPassDepthStencil> depth_stencil;
+    std::uint32_t flags = 0;
+    // Captured at record time from the access types. A passive colour slot is dropped in replay and the remaining
+    // MRT slots are compacted; a plane is only attached when its access is active and its aspect is present.
+    std::uint32_t active_color_mask = 0;  // bit i: original RTV slot i is active
+    bool depth_active = false;
+    bool stencil_active = false;
+};
+struct EndRenderPass {};
+
+// A colour slot with NO_ACCESS at both ends (no CLEAR, nothing stored) is passive: replay neither binds nor
+// transitions it, and compacts shader output k to the k-th active slot.
+inline bool render_pass_color_active(std::uint32_t beginning, std::uint32_t ending) {
+    return beginning != d3d12_render_beginning::no_access ||
+           (ending != d3d12_render_ending::no_access && ending != d3d12_render_ending::discard);
+}
+
+// A plane is active when its beginning reads/clears it or its ending stores it. A beginning DISCARD is active and
+// maps to Vulkan DONT_CARE; it is never represented by dropping the attachment as if it were NO_ACCESS.
+inline bool render_pass_plane_active(std::uint32_t beginning, std::uint32_t ending) {
+    return beginning != d3d12_render_beginning::no_access || ending == d3d12_render_ending::preserve;
+}
+
 // DiscardResource. whole: the whole resource (a null region); first_subresource and count are then ignored.
 // Otherwise count subresources from first_subresource, an explicit range even when count is all_subresources.
 // partial: the region had rectangles, so only part of each subresource is discarded.
@@ -647,8 +726,8 @@ using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, Glo
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
                              WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
-                             ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
-                             AccelerationStructurePostbuild>;
+                             ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, BeginRenderPass,
+                             EndRenderPass, CopyAccelerationStructure, AccelerationStructurePostbuild>;
 
 class CommandList {
 public:
@@ -742,6 +821,58 @@ public:
         if (!draw.count || !draw.instances) return !closed_;
         return append(std::move(draw));
     }
+
+    // BeginRenderPass (GCL4). The COM layer copies every CPU descriptor before this call, so the IR owns the views.
+    // No flags are accepted (suspend/resume is not emulated); only PRESERVE/CLEAR/DISCARD/NO_ACCESS are accepted.
+    // RESOLVE, UAV writes, read-only bindings and the LOCAL access types are refused rather than silently replayed.
+    bool begin_render_pass(const BeginRenderPass& pass) {
+        if (closed_ || render_pass_open_) return false;
+        if (pass.flags & ~d3d12_render_pass_flag::supported) return false;
+        if (pass.colors.empty() && !pass.depth_stencil) return false;
+        if (pass.colors.size() > 8) return false;  // D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT
+        for (const auto& c : pass.colors) {
+            if (!valid(c.view)) return false;
+            if (c.beginning.type > d3d12_render_beginning::no_access) return false;
+            if (c.ending.type > d3d12_render_ending::no_access ||
+                c.ending.type == d3d12_render_ending::resolve)
+                return false;
+        }
+        if (pass.depth_stencil) {
+            const auto& d = *pass.depth_stencil;
+            if (!valid(d.view)) return false;
+            const RenderPassAccess* accesses[] = {&d.depth_beginning, &d.stencil_beginning,
+                                                  &d.depth_ending, &d.stencil_ending};
+            for (std::size_t i = 0; i < 4; ++i) {
+                const std::uint32_t max = i < 2 ? d3d12_render_beginning::no_access
+                                                : d3d12_render_ending::no_access;
+                if (accesses[i]->type > max) return false;
+                if (i >= 2 && accesses[i]->type == d3d12_render_ending::resolve) return false;
+            }
+        }
+        BeginRenderPass recorded = pass;
+        for (std::size_t slot = 0; slot < recorded.colors.size(); ++slot)
+            if (render_pass_color_active(recorded.colors[slot].beginning.type, recorded.colors[slot].ending.type))
+                recorded.active_color_mask |= 1u << slot;
+        if (recorded.depth_stencil) {
+            recorded.depth_active = render_pass_plane_active(recorded.depth_stencil->depth_beginning.type,
+                                                             recorded.depth_stencil->depth_ending.type);
+            recorded.stencil_active = render_pass_plane_active(recorded.depth_stencil->stencil_beginning.type,
+                                                               recorded.depth_stencil->stencil_ending.type);
+        }
+        if (!append(std::move(recorded))) return false;
+        render_pass_open_ = true;
+        return true;
+    }
+
+    // A pass must end in the same list; an unclosed pass makes Close report E_INVALIDARG and blocks replay.
+    bool end_render_pass() {
+        if (closed_ || !render_pass_open_) return false;
+        if (!append(EndRenderPass{})) return false;
+        render_pass_open_ = false;
+        return true;
+    }
+
+    bool render_pass_open() const { return render_pass_open_; }
 
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
     bool clear_render_target(const TargetView& target, const ClearColor& color, std::span<const Rect> rects = {}) {
@@ -890,6 +1021,7 @@ public:
         commands_.clear();
         active_.clear();
         closed_ = false;
+        render_pass_open_ = false;
         return true;
     }
 
@@ -932,6 +1064,7 @@ private:
 
     std::vector<Command> commands_;
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
+    bool render_pass_open_ = false;
     bool closed_ = false;
 };
 

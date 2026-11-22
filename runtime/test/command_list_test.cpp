@@ -307,5 +307,103 @@ int main() {
     CHECK(query_fits_heap(h::so_statistics, q::so_statistics_stream3) && !query_fits_heap(6, q::occlusion));
     CHECK(query_result_size(q::occlusion) == 8 && query_result_size(q::timestamp) == 8);
     CHECK(query_result_size(q::pipeline_statistics) == 88 && query_result_size(q::so_statistics_stream0) == 16);
+
+    // Render passes: the IR owns a by-value copy of every descriptor, scopes balance, and everything this layer
+    // cannot replay safely (RESOLVE, UAV writes, read-only bindings, LOCAL access types) is refused.
+    {
+        CommandList rp;
+        namespace b = d3d12_render_beginning;
+        namespace e = d3d12_render_ending;
+        namespace f = d3d12_render_pass_flag;
+        TargetView rtv{100, 0, 0, 1};
+        RenderPassColor color{};
+        color.view = rtv;
+        color.beginning.type = b::clear;
+        color.beginning.color = {0.25f, 0.5f, 0.75f, 1.0f};
+        color.ending.type = e::preserve;
+        BeginRenderPass pass{};
+        pass.colors.push_back(color);
+        RenderPassDepthStencil ds{};
+        ds.view = TargetView{200, 0, 0, 1};
+        ds.depth_beginning.type = b::clear;
+        ds.depth_beginning.depth = 0.5f;
+        ds.stencil_beginning.type = b::no_access;
+        ds.depth_ending.type = e::no_access;
+        ds.stencil_ending.type = e::discard;
+        pass.depth_stencil = ds;
+
+        CHECK(!rp.end_render_pass());       // nothing to end
+        CHECK(!rp.begin_render_pass({}));   // no attachments
+        CHECK(rp.begin_render_pass(pass));  // rtv is copied into the IR here
+        rtv = {999, 2, 3, 4};               // the source descriptor is rewritten after recording
+        CHECK(rp.render_pass_open());
+        CHECK(!rp.begin_render_pass(pass));  // no nesting
+        CHECK(rp.end_render_pass());
+        CHECK(!rp.end_render_pass());
+        CHECK(!rp.render_pass_open());
+        CHECK(rp.close());
+
+        const auto& cmds = rp.commands();
+        CHECK(cmds.size() == 2);
+        const auto& begun = std::get<BeginRenderPass>(cmds[0]);
+        CHECK(std::holds_alternative<EndRenderPass>(cmds[1]));
+        CHECK(begun.colors.size() == 1);
+        CHECK(begun.colors[0].view.resource == 100 && begun.colors[0].view.layer_count == 1);
+        CHECK(begun.colors[0].beginning.type == b::clear && begun.colors[0].beginning.color[1] == 0.5f);
+        CHECK(begun.colors[0].ending.type == e::preserve);
+        CHECK(begun.depth_stencil && begun.depth_stencil->view.resource == 200);
+        CHECK(begun.depth_stencil->depth_beginning.depth == 0.5f);
+        CHECK(begun.depth_stencil->stencil_beginning.type == b::no_access);
+        CHECK(begun.depth_stencil->depth_ending.type == e::no_access);
+        CHECK(begun.depth_stencil->stencil_ending.type == e::discard);
+        // The active-slot snapshot is taken at record time: slot 0 and depth are active, stencil is passive, and a
+        // passive colour slot never enters the mask (replay compacts the remaining MRT slots).
+        CHECK(begun.active_color_mask == 1u && begun.depth_active && !begun.stencil_active);
+
+        CHECK(rp.reset() && !rp.render_pass_open());
+        auto bad = pass;
+        bad.flags = f::allow_uav_writes;
+        CHECK(!rp.begin_render_pass(bad));
+        bad.flags = f::bind_read_only_depth;
+        CHECK(!rp.begin_render_pass(bad));
+        bad = pass;
+        bad.colors[0].ending.type = e::resolve;
+        CHECK(!rp.begin_render_pass(bad));
+        bad = pass;
+        bad.colors[0].beginning.type = 7;  // PRESERVE_LOCAL_UAV
+        CHECK(!rp.begin_render_pass(bad));
+        bad = pass;
+        bad.depth_stencil->stencil_ending.type = e::resolve;
+        CHECK(!rp.begin_render_pass(bad));
+        bad = pass;
+        bad.colors.clear();
+        bad.depth_stencil.reset();
+        CHECK(!rp.begin_render_pass(bad));
+        bad = pass;
+        bad.colors[0].view = {};
+        CHECK(!rp.begin_render_pass(bad));
+        // No flag is accepted: SUSPENDING/RESUMING are not emulated, so each is refused on its own and together.
+        bad = pass;
+        bad.flags = f::suspending;
+        CHECK(!rp.begin_render_pass(bad));
+        bad.flags = f::resuming;
+        CHECK(!rp.begin_render_pass(bad));
+        bad.flags = f::suspending | f::resuming;
+        CHECK(!rp.begin_render_pass(bad));
+
+        // NO_ACCESS/NO_ACCESS colours are passive and are not in the mask; DISCARD beginnings are active.
+        auto compact = pass;
+        RenderPassColor passive{};
+        passive.view = TargetView{300, 0, 0, 1};
+        passive.beginning.type = b::no_access;
+        passive.ending.type = e::no_access;
+        compact.colors.push_back(passive);
+        compact.depth_stencil->depth_beginning.type = b::discard;
+        CHECK(rp.begin_render_pass(compact));
+        const auto& compacted = std::get<BeginRenderPass>(rp.commands()[0]);
+        CHECK(compacted.active_color_mask == 1u);  // only slot 0 is active
+        CHECK(compacted.depth_active);             // DISCARD is active, not a dropped NO_ACCESS attachment
+        CHECK(rp.end_render_pass());
+    }
     return 0;
 }

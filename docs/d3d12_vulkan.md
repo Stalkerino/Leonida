@@ -2228,11 +2228,27 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 
   The access itself is never dropped, so the dependency still covers everything the application named, over a
   slightly larger scope.
-- Render passes: `BeginRenderPass`/`EndRenderPass` map to `vkCmdBeginRendering`/`vkCmdEndRendering` (dynamic
-  rendering). The `D3D12_RENDER_PASS_BEGINNING_ACCESS`/`ENDING_ACCESS` types give the load/store ops and resolve
-  targets. Suspending/resuming passes have no direct Vulkan equivalent; split them into two rendering scopes with
-  the same attachments and `LOAD`/`STORE`. If the game does not use render passes, build a rendering scope per draw
-  from the bound RTVs/DSV and let explicit `Clear*View` calls do the clears.
+- Render passes (D3D-27, implemented subset): `ID3D12GraphicsCommandList4::BeginRenderPass`/`EndRenderPass` are
+  recorded into the command-list IR; every CPU descriptor is copied into it at the call, so rewriting a slot before
+  `ExecuteCommandLists` cannot change the submitted attachments. Replay opens one `vkCmdBeginRendering` scope over
+  the captured RTVs/DSV and closes it at `EndRenderPass`. All layout transitions run **before** `BeginRendering`;
+  a draw inside the scope reuses it, takes its attachments and formats from the pass snapshot (not the stale OM
+  bindings, VUID 08910) and emits no barrier inside the scope (VUID 09553). Colour slots with NO_ACCESS at both ends
+  are dropped without being resolved or transitioned, and the remaining MRT slots are compacted to shader-output
+  order. Beginning CLEAR/PRESERVE/DISCARD/NO_ACCESS map to `CLEAR`/`LOAD`/`DONT_CARE`/`DONT_CARE`, ending
+  PRESERVE/DISCARD/NO_ACCESS to `STORE`/`STORE_OP_NONE`/`STORE_OP_NONE`; a DISCARD beginning is a real attachment
+  with DONT_CARE, never a dropped NO_ACCESS one. A beginning NO_ACCESS is a deliberate conservative choice: core
+  Vulkan 1.3 has no "do not load" op (`VK_ATTACHMENT_LOAD_OP_NONE` needs `VK_KHR_load_store_op_none`), so it is
+  DONT_CARE, never LOAD or CLEAR. Depth and stencil have independent activity flags and aspect masks but share one
+  DSV view when both are active (VUID 06085); D24 clears are quantised as elsewhere. Barriers, dispatches, copies,
+  resolves, query resets and predication recorded between Begin/End are **refused** in preparation instead of
+  emitting invalid Vulkan inside the scope. An unclosed pass fails `Close`; that error is persisted and surfaced
+  again by `Reset` and the queue refuses the list before any batch is emitted. `CheckFeatureSupport` still reports
+  `RenderPassesTier = TIER_0` and `RenderPassesValid = FALSE`.
+  **Open:** ending RESOLVE (use `ResolveSubresource`/the depth-resolve replay path instead), `ALLOW_UAV_WRITES`,
+  read-only depth/stencil bindings, the LOCAL access types, MSAA/1D/3D attachments, multi-planar formats and
+  **SUSPENDING/RESUMING** are refused with a diagnostic rather than approximated. Tile-memory suspend/resume has no
+  dynamic-rendering equivalent here; no flag is accepted and no matching submit-group/flags support is claimed.
 
 ### 4.4 Fences, queues and frames in flight
 

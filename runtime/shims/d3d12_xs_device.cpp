@@ -1072,6 +1072,11 @@ PresentState* present_state_for(DeviceProxy* device) {
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
         return state;
     }
+    // Opt-in: the console drives the display, so the stand-in's window is created hidden and no caller shows it
+    // (LEONIDA_PRESENTX_SHOW=1). Shown without activation, so the user's focus stays where it is.
+    char show[2] = {};
+    if (GetEnvironmentVariableA("LEONIDA_PRESENTX_SHOW", show, sizeof(show)) == 1 && show[0] == '1')
+        ShowWindow(state->window, SW_SHOWNOACTIVATE);
     auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
     if (!presenter) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");

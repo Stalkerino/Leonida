@@ -3110,6 +3110,10 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   timer, not the display's real scan), so on a real display the tear position is whatever the driver does at that
   moment. What is checked is that the immediate mode is chosen and presented with 0 VUIDs in our runs with `LEONIDA_VK_VALIDATION=1`; no scan-out
   or tearing was observed.
+  `LEONIDA_PRESENTX_SHOW=1` (exactly `1`) shows the window `PresentX` presents into. That window is created by the
+  console queue proxy and never shown, so the frames are presented with nothing on screen; the option shows it
+  without activation (`SW_SHOWNOACTIVATE`), leaving the user's focus alone. Off by default: the headless runs compare
+  pixels.
 - *Tokens*: what the console does with a null, repeated or out-of-order token is **unmeasured**, and a title that
   presents a loading screen with `Token = 0`, presents again with one token, or presents from a render thread out of
   order must not freeze. So those are presented anyway and logged once per kind; only a token that was never handed

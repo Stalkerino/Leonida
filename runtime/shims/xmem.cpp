@@ -462,7 +462,7 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
 DWORD view_protect(const Window& window) {
     // A view takes no cache modifier: MapViewOfFile3 refuses PAGE_WRITECOMBINE (0x400, which three of the measured
     // windows carry next to PAGE_READWRITE) and PAGE_NOCACHE with ERROR_INVALID_PARAMETER.
-    const DWORD protect = window.protect & ~static_cast<DWORD>(PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_GUARD);
+    const DWORD protect = window.protect & ~static_cast<DWORD>(PAGE_WRITECOMBINE | PAGE_NOCACHE);
     return protect == PAGE_NOACCESS ? PAGE_READWRITE : protect;
 }
 

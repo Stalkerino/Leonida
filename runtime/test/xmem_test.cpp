@@ -502,6 +502,30 @@ void test_write_combine_window(const PhysicalApi& api) {
     check(api.free_pages(1, &page) == TRUE, "free the write-combine window's page");
 }
 
+// A cache modifier belongs to the section, whereas a guard controls CPU access.
+void test_guarded_physical_window(const PhysicalApi& api) {
+    void* const window = api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x27,
+                                           PAGE_READONLY | PAGE_GUARD | PAGE_GRAPHICS_READWRITE);
+    check(window != nullptr, "reserve a guarded physical window");
+    if (!window) return;
+    uint64_t page = 0;
+    uint64_t count = 1;
+    const bool allocated = api.allocate(0x280, &count, &page) && count == 1;
+    check(allocated, "allocate a page for a guarded window");
+    if (allocated) {
+        if (api.map(window, 1, &page)) {
+            MEMORY_BASIC_INFORMATION info{};
+            check(VirtualQuery(window, &info, sizeof(info)) == sizeof(info) &&
+                      info.Protect == (PAGE_READONLY | PAGE_GUARD), "a mapped guarded view retains its guard");
+            check(api.map(window, 1, nullptr) == window, "unmap the guarded view");
+        } else {
+            check(reserved_only(static_cast<uint8_t*>(window)), "a rejected guarded view remains reserved");
+        }
+        check(api.free_pages(1, &page) == TRUE, "free the guarded window's page");
+    }
+    check(VirtualFree(window, 0, MEM_RELEASE) == TRUE, "release the guarded window");
+}
+
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
 void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
@@ -748,6 +772,7 @@ int main() {
         test_physical_pages(physical);
         test_placeholders(physical);
         test_write_combine_window(physical);
+        test_guarded_physical_window(physical);
     }
 
     print_result();

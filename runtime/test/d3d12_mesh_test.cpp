@@ -9,7 +9,8 @@
 //   - Draws: DispatchMesh(2, 2, 1) with root constants (0, 0) and a red tint fills the top-left quadrant;
 //     DispatchMesh(1, 1, 2) moved by (1, -1) with a green tint fills the top half of the bottom-right one, so the
 //     Y and Z counts reach the shader; the stream's VS PSO draws a full-screen triangle through a viewport on the
-//     bottom-left quadrant (yellow). Each pixel is read back and compared.
+//     bottom-left quadrant (yellow). One mesh bundle draws two tiles in the top-right quadrant using the parent's
+//     offset and tint at each ExecuteBundle. Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
@@ -318,6 +319,15 @@ int main() {
         EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list6.p))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
+        Ref<ID3D12CommandAllocator> bundle_allocator;
+        Ref<ID3D12GraphicsCommandList6> bundle;
+        EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                        IID_PPV_ARGS(&bundle_allocator.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p,
+                                                   mesh_pso.p, IID_PPV_ARGS(&bundle.p))));
+        bundle->DispatchMesh(1, 1, 1);
+        EXPECT(bundle->Close() == S_OK);
+
         D3D12_RESOURCE_BARRIER to_target =
             transition(target.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->ResourceBarrier(1, &to_target);
@@ -342,6 +352,15 @@ int main() {
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 256);
         list6->DispatchMesh(1, 1, 2);
+        // Replay the same mesh group twice. Only the parent supplies the position and tint for each tile.
+        const float first_tile[2] = {1, 0}, second_tile[2] = {1.5f, -0.5f};
+        list->SetGraphicsRoot32BitConstants(0, 2, first_tile, 0);
+        list->SetGraphicsRootConstantBufferView(1, upload_va);
+        list->ExecuteBundle(bundle.p);
+        list->SetGraphicsRoot32BitConstants(0, 2, second_tile, 0);
+        list->SetGraphicsRootConstantBufferView(1, upload_va + 256);
+        list->ExecuteBundle(bundle.p);
+
         // The stream's VS PSO: a full-screen triangle through a viewport on the bottom-left quadrant, yellow.
         const D3D12_VIEWPORT bottom_left{0, float(size / 2), float(size / 2), float(size / 2), 0, 1};
         list->RSSetViewports(1, &bottom_left);
@@ -405,6 +424,8 @@ int main() {
         rtv_heap.reset();
         list6.reset();
         list.reset();
+        bundle.reset();
+        bundle_allocator.reset();
         allocator.reset();
         queue.reset();
         fence.reset();
@@ -416,11 +437,13 @@ int main() {
     for (UINT row = 0; row < size; ++row) {
         for (UINT col = 0; col < size; ++col) {
             const bool top = row < size / 2, left = col < size / 2;
+            const bool red_tile = row < size / 4 && col >= size / 2 && col < size * 3 / 4;
+            const bool green_tile = row >= size / 4 && top && col >= size * 3 / 4;
             using Pixel = std::array<std::uint8_t, 4>;
-            const Pixel want = top && left                            ? Pixel{255, 0, 0, 255}
-                               : !top && left                         ? Pixel{255, 255, 0, 255}
-                               : !top && !left && row < size * 3 / 4  ? Pixel{0, 255, 0, 255}
-                                                                      : Pixel{0, 0, 255, 255};
+            Pixel want{0, 0, 255, 255};
+            if ((top && left) || red_tile) want = {255, 0, 0, 255};
+            else if (!top && left) want = {255, 255, 0, 255};
+            else if ((!top && !left && row < size * 3 / 4) || green_tile) want = {0, 255, 0, 255};
             const std::uint8_t* got = pixels.data() + row * 256 + col * 4;
             if (std::equal(want.begin(), want.end(), got)) continue;
             if (mismatches++ < 6)
@@ -434,7 +457,7 @@ int main() {
         return 1;
     }
     std::printf("D3D-29: mesh tier 1; mesh and VS PSOs from pipeline state streams (9 refused as invalid, 2 as not "
-                "implemented); DispatchMesh over X, Y and Z and a stream VS draw matched all %u pixels; wrong-kind "
+                "implemented); direct and bundled DispatchMesh and a stream VS draw matched all %u pixels; wrong-kind "
                 "draws fail at execution, oversized grids at Close\n",
                 size * size);
     return 0;

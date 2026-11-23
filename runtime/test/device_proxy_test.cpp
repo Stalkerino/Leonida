@@ -342,9 +342,9 @@ int main(int argc, char** argv) {
         check(hr == S_OK, "slot 79 ScheduleFrameEventX returns S_OK");
 
         std::uint64_t token = 0, token2 = 0;
-        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, INFINITE, nullptr, 0, &token);
+        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 1000, nullptr, 0, &token);
         check(hr == S_OK && token != 0, "slot 80 WaitFrameEventX returns a non-zero token");
-        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 0, &token2);
+        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 1000, nullptr, 0, &token2);
         check(hr == S_OK && token2 != 0 && token2 != token, "slot 80 returns a fresh token on the next wait");
         hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 0, nullptr);
         check(hr == E_POINTER, "slot 80 refuses a null token with E_POINTER");

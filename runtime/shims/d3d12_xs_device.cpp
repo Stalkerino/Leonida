@@ -20,10 +20,10 @@
 // The public HLE Freminet/ScarlettX reports five more Xbox device slots (a third-party observation, not a Microsoft
 // ABI); the generic thunk routes them before it forwards anything: 48 CreateCommandQueueX, 73 CreateCommandListX,
 // 78 SetFrameIntervalX, 79 ScheduleFrameEventX and 80 WaitFrameEventX. The slots can be moved with LEONIDA_XS_*_SLOT
-// for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
-// behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
+// for a trace that disagrees. The device and the presenter created by its first queue PresentX share a frame clock.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+#include "../src/frame_pacer.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -83,13 +83,9 @@ struct DeviceProxy {
     DxgiAdapterProvider adapter_provider;
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
-    // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. Tokens were never measured;
-    // they start at 1 and only have to be fresh and non-zero for the boot sequence. Waiting returns at once: there is
-    // no vblank source until a presenter exists, and a bounded zero wait cannot stall the first frame.
-    std::atomic<std::uint32_t> frame_interval_us{0};
-    std::atomic<std::uint32_t> frame_latency{1};
-    std::atomic<bool> frame_event_scheduled{false};
-    std::atomic<std::uint64_t> frame_next_token{1};
+    // Created with the device so frame events can be registered before the first PresentX creates a window.
+    leonida::SteadyFrameClock frame_clock;
+    leonida::FramePacer frame_pacer{frame_clock};
 };
 
 // Freed in proxy_release; defined where the states are complete.
@@ -1075,7 +1071,7 @@ PresentState* present_state_for(DeviceProxy* device) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
         return state;
     }
-    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter));
+    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), device->frame_pacer);
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(state->window));
     return state;
 }
@@ -1880,44 +1876,6 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
 }
 
-// Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are
-// not used before a presenter exists. The period is a vblank period in microseconds in the public samples (16667 for
-// 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
-HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std::uint64_t interval_us,
-                                   std::uint64_t latency, std::uint64_t flags) {
-    (void)output;
-    (void)flags;
-    self->frame_interval_us.store(static_cast<std::uint32_t>(interval_us), std::memory_order_relaxed);
-    self->frame_latency.store(static_cast<std::uint32_t>(latency ? latency : 1), std::memory_order_relaxed);
-    return S_OK;
-}
-
-// Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
-HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
-                                     std::uint64_t flags) {
-    (void)event;
-    (void)offset_us;
-    (void)flags;
-    self->frame_event_scheduled.store(true, std::memory_order_relaxed);
-    return S_OK;
-}
-
-// Xbox device slot 80 (public HLE): WaitFrameEventX(event, timeout_ms, pEvent, flags, &token). It returns at once with
-// a fresh non-zero token (the first-frame choice): there is no vblank source behind the device before a presenter, and
-// a zero wait cannot stall the title. A null token pointer is E_POINTER, as a _Out_ parameter.
-HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t timeout_ms,
-                                 std::uint64_t flags, std::uint64_t token_word) {
-    (void)event;
-    (void)timeout_ms;
-    (void)flags;
-    auto* token = reinterpret_cast<std::uint64_t*>(token_word);
-    if (!token) return E_POINTER;
-    std::uint64_t value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
-    if (value == 0) value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);  // skip the null token
-    *token = value;
-    return S_OK;
-}
-
 // Xbox device slot 73 (public HLE): CreateCommandListX(desc, allocator, initial_state, riid, out). The console call is
 // not the PC six-argument form: the type is the first word of D3D12XBOX_COMMAND_LIST_DESC and there is no node mask
 // (the HLE passes 0). The second desc word is logged, not interpreted: its public layout is not established.
@@ -2274,15 +2232,21 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
         if (Slot == routes.frame_interval) {
             log_xbox_route_once(Slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_set_frame_interval_x(self, a1, a2, a3, a4));
+            return hr_to_u64(self->frame_pacer.set_frame_interval(static_cast<UINT>(a2), static_cast<UINT>(a3),
+                                                                  static_cast<UINT>(a4)));
         }
         if (Slot == routes.schedule_event) {
             log_xbox_route_once(Slot, "ScheduleFrameEventX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_schedule_frame_event_x(self, a1, a2, a4));
+            if (a3) return hr_to_u64(E_NOTIMPL);  // ancillary events are not implemented by the presenter
+            return hr_to_u64(self->frame_pacer.schedule_frame_event(static_cast<UINT>(a1), static_cast<UINT>(a2),
+                                                                    static_cast<UINT>(a4)));
         }
         if (Slot == routes.wait_event) {
             log_xbox_route_once(Slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
+            if (static_cast<UINT>(a1) == leonida::frame_event_origin && !a5) return hr_to_u64(E_POINTER);
+            if (a3) return hr_to_u64(E_NOTIMPL);
+            return hr_to_u64(self->frame_pacer.wait_frame_event(static_cast<UINT>(a1), static_cast<DWORD>(a2),
+                                                                static_cast<UINT>(a4), reinterpret_cast<UINT64*>(a5)));
         }
         if (Slot == routes.queue_x) {
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
@@ -2369,8 +2333,12 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool co
     if (!out) return E_POINTER;
     *out = nullptr;
 
-    DeviceProxy* proxy = new (std::nothrow) DeviceProxy;
-    if (!proxy) return E_OUTOFMEMORY;
+    DeviceProxy* proxy;
+    try {
+        proxy = new DeviceProxy;
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    }
     proxy->vtable = get_vtable();
     proxy->real = real;
     proxy->real_vtable = *reinterpret_cast<void***>(real);

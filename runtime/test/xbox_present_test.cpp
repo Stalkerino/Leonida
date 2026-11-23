@@ -333,8 +333,16 @@ int main() {
         EXPECT(presenter);
         EXPECT(presenter->enable_capture());
 
+        // The device issues the first token before the queue creates its presenter.
         leonida::ManualFrameClock clock;
-        auto owner = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), &clock);
+        leonida::FramePacer device_pacer(clock);
+        const UINT period = rt::d3d12::xbox_frame_interval_60hz_us;
+        EXPECT(device_pacer.set_frame_interval(period, 1, 0) == S_OK);
+        EXPECT(device_pacer.schedule_frame_event(leonida::frame_event_origin, 0, 0) == S_OK);
+        clock.advance_us(period);
+        std::uint64_t token = 0;
+        EXPECT(device_pacer.wait_frame_event(leonida::frame_event_origin, 0, 0, &token) == S_OK && token == 1);
+        auto owner = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), device_pacer);
         rt::d3d12::XboxPresentation& xbox = *owner;
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -407,12 +415,9 @@ int main() {
         };
 
         // The title's frame loop: wait for the origin, render (the caller did), PresentX with that token.
-        const UINT period = rt::d3d12::xbox_frame_interval_60hz_us;
-        EXPECT(SUCCEEDED(xbox.SetFrameIntervalX(nullptr, period, 1, 0)));
-        EXPECT(SUCCEEDED(xbox.ScheduleFrameEventX(rt::d3d12::xbox_frame_event_origin, 0, 0)));
-        const auto next_token = [&](std::uint64_t& token) -> bool {
+        const auto next_token = [&](std::uint64_t& next) -> bool {
             clock.advance_us(period);
-            return xbox.WaitFrameEventX(rt::d3d12::xbox_frame_event_origin, 0, 0, &token) == S_OK;
+            return xbox.WaitFrameEventX(rt::d3d12::xbox_frame_event_origin, 0, 0, &next) == S_OK;
         };
         UINT want_w = width, want_h = height;  // the client size the frames are expected at (the resize case changes it)
         const auto grab = [&](Frame& frame) -> bool {
@@ -423,7 +428,6 @@ int main() {
 
         const FLOAT blue_ish[4] = {0.2f, 0.6f, 0.9f, 1.0f};  // 51, 153, 230
         const FLOAT red[4] = {1, 0, 0, 1}, green[4] = {0, 1, 0, 1}, blue[4] = {0, 0, 1, 1};
-        std::uint64_t token = 0;
         Frame frame;
         const auto plane_of = [&](Source& s, std::uint64_t t, const D3D12_RECT* rect = nullptr) {
             return rt::d3d12::XboxPresentPlaneParameters{t, 1, &s.resource.p, rect, 0};
@@ -433,7 +437,6 @@ int main() {
         Source rgba;
         EXPECT(make_source(DXGI_FORMAT_R8G8B8A8_UNORM, rgba));
         EXPECT(fill(rgba, blue_ish));
-        EXPECT(next_token(token) && token == 1);
         auto plane = plane_of(rgba, token);
         EXPECT(xbox.PresentX(1, &plane, nullptr) == S_OK);
         EXPECT(grab(frame));

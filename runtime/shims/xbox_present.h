@@ -93,6 +93,8 @@ public:
     // `clock` null: real time (a steady high-resolution timer). Tests pass a leonida::ManualFrameClock, which must
     // outlive this object. `presenter` is what create_window_presenter returned.
     explicit XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock = nullptr);
+    // A device can schedule an origin before it has a window. Its pacer must outlive this queue presenter.
+    XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FramePacer& device_pacer);
     ~XboxPresentation();
     XboxPresentation(const XboxPresentation&) = delete;
     XboxPresentation& operator=(const XboxPresentation&) = delete;
@@ -160,11 +162,14 @@ public:
     std::uint64_t immediate_presents() const { return pacer_.immediate_presents(); }
 
 private:
+    XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock,
+                     leonida::FramePacer* device_pacer);
     float effective_sdr_white_nits();  // override, else the cached Windows setting while HDR10, else 203
     void display_white_worker();       // refreshes display_white_ off the present path
     std::unique_ptr<WindowPresenter> presenter_;
     std::unique_ptr<leonida::FrameClock> own_clock_;
-    leonida::FramePacer pacer_;
+    std::unique_ptr<leonida::FramePacer> own_pacer_;
+    leonida::FramePacer& pacer_;
     std::mutex present_mutex_;  // PresentX, SuspendX and ResumeX one at a time
     std::atomic<std::uint64_t> presents_{0};
     bool logged_planes_ = false, logged_threshold_ = false, logged_display_ = false, logged_color_space_ = false,

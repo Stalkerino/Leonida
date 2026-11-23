@@ -722,20 +722,24 @@ int check_xbox_slots() {
     EXPECT(device && xs::device_proxy_slot_count(device) == 80);
     xs::reset_device_proxy_stats();
 
-    // 78 SetFrameIntervalX(output, interval_us, latency, flags): S_OK, not forwarded to PC slot 78.
-    EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK);
-    EXPECT(mock->calls[78] == 0 && xs::device_slot_hits(78) == 1);
-    // 79 ScheduleFrameEventX(event, offset_us, pEvent, flags): S_OK, not forwarded to PC slot 79.
-    EXPECT(hr_of(raw(device, 79, 0, 0, 0x1234, 0)) == S_OK);
-    EXPECT(mock->calls[79] == 0 && xs::device_slot_hits(79) == 1);
-
-    // 80 WaitFrameEventX(event, timeout_ms, pEvent, flags, &token): a fresh non-zero token each time; a null token
-    // pointer is E_POINTER; the call never blocks (this test would hang otherwise).
-    std::uint64_t token = 0, token2 = 0;
-    EXPECT(hr_of(raw(device, 80, 0, 0xffffffffu, 0, 0, word(&token))) == S_OK && token != 0);
-    EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token2))) == S_OK && token2 != 0 && token2 != token);
+    // The device forwards interval, offset and flags to its clock. Use a long period for the nonblocking poll.
+    std::uint64_t token = 77;
+    EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == HRESULT_FROM_WIN32(ERROR_INVALID_STATE));
+    EXPECT(hr_of(raw(device, 78, 0, 0, 1, 0)) == E_INVALIDARG);
+    EXPECT(hr_of(raw(device, 78, 0, 60000000, 1, 0)) == S_OK);
+    EXPECT(hr_of(raw(device, 79, 0, 60000000, 0, 0)) == E_INVALIDARG);
+    EXPECT(hr_of(raw(device, 79, 0, 0, 0x1234, 0)) == E_NOTIMPL);
+    EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK);
+    EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == HRESULT_FROM_WIN32(WAIT_TIMEOUT) && token == 77);
     EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, 0)) == E_POINTER);
-    EXPECT(mock->calls[80] == 0 && xs::device_slot_hits(80) == 3);
+    EXPECT(hr_of(raw(device, 80, 0, 0, 0x1234, 0, word(&token))) == E_NOTIMPL);
+    // Changing the period keeps the origin armed. Only successful waits issue a token.
+    EXPECT(hr_of(raw(device, 78, 0, 1000, 1, 0)) == S_OK);
+    EXPECT(hr_of(raw(device, 80, 0, 1000, 0, 0, word(&token))) == S_OK && token == 1);
+    EXPECT(hr_of(raw(device, 80, 0, 1000, 0, 0, word(&token))) == S_OK && token == 2);
+    EXPECT(mock->calls[78] == 0 && xs::device_slot_hits(78) == 3);
+    EXPECT(mock->calls[79] == 0 && xs::device_slot_hits(79) == 3);
+    EXPECT(mock->calls[80] == 0 && xs::device_slot_hits(80) == 6);
 
     // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path.
     void* queue = nullptr;
@@ -813,7 +817,7 @@ int run_env_slots(bool valid) {
         // Every route moved: the new slot is handled, the default slot is forwarded to the mock.
         EXPECT(hr_of(raw(device, 96, 0, 16667, 1, 0)) == S_OK && mock->calls[96] == 0);
         EXPECT(hr_of(raw(device, 97, 0, 0, 0, 0)) == S_OK && mock->calls[97] == 0);
-        EXPECT(hr_of(raw(device, 98, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[98] == 0);
+        EXPECT(hr_of(raw(device, 98, 0, 1000, 0, 0, word(&token))) == S_OK && token && mock->calls[98] == 0);
         void* queue = nullptr;
         EXPECT(hr_of(raw(device, 99, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
         EXPECT(xs::is_queue_proxy(queue) && mock->calls[99] == 0);
@@ -835,7 +839,7 @@ int run_env_slots(bool valid) {
         // forwarded unchanged.
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
-        EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
+        EXPECT(hr_of(raw(device, 80, 0, 1000, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
         EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 1);  // not an Xbox slot: forwarded
     }
     EXPECT(release(device) == 0 && mock->refs == 0);

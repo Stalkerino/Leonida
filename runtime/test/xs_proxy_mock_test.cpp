@@ -666,6 +666,29 @@ int check_allocators() {
     return 0;
 }
 
+int check_xbox_sampler() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device && xs::device_slot_overridden(61));
+    xs::reset_device_proxy_stats();
+
+    // 61 CreateSamplerX(desc, dest): the PC CreateSampler (slot 22) gets the same two words, not the PC slot 61
+    // (CreateMetaCommand). A null description is skipped without reaching the device.
+    D3D12_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    const std::uint64_t sampler_handle = 0x7ff012340040ull;
+    raw(device, 61, word(&sampler), sampler_handle);
+    EXPECT(mock->calls[61] == 0 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 1);
+    EXPECT(mock->args[22][0] == word(&sampler) && mock->args[22][1] == sampler_handle);
+    raw(device, 61, 0, sampler_handle);
+    EXPECT(mock->calls[61] == 0 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 2);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    return 0;
+}
+
 // ---- 7. The refused tail and the guard region ----
 
 int check_tail(bool want_guarded) {
@@ -908,7 +931,7 @@ int main(int argc, char** argv) {
     if (argc == 2) return run_fault_mode(argv[1]);
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_descriptor_heap_hooks())
+        check_alloc_failures() || check_allocators() || check_xbox_sampler() || check_descriptor_heap_hooks())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

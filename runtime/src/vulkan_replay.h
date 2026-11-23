@@ -43,6 +43,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <map>
@@ -3983,6 +3984,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const Viewport& v = draw->viewport;
             const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
             vk.set_viewport(command_buffer, 0, 1, &viewport);
+            if (v.width <= 4 && v.height <= 4) {
+                std::fprintf(stderr, "D3D-604 emit: RTV=%u viewport=(%g,%g %gx%g) area=%ux%u "
+                             "vkCmdSetScissor=(%d,%d %ux%u)\n",
+                             unsigned(!d.colors.empty() && d.colors[0].view != VK_NULL_HANDLE),
+                             v.x, v.y, v.width, v.height, d.area.width, d.area.height,
+                             d.scissor.offset.x, d.scissor.offset.y, d.scissor.extent.width, d.scissor.extent.height);
+            }
             vk.set_scissor(command_buffer, 0, 1, &d.scissor);
             const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
             vk.set_primitive_topology(command_buffer, topology);

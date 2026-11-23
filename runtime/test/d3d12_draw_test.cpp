@@ -1039,17 +1039,18 @@ int main() {
             list->SetGraphicsRootSignature(root.p);
             list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
             list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            const auto record_case = [&](UINT i, UINT query) {
+                list->RSSetViewports(1, &cases[i].viewport);
+                list->RSSetScissorRects(1, &cases[i].scissor);
+                list->BeginQuery(queries.p, D3D12_QUERY_TYPE_OCCLUSION, query);
+                list->DrawInstanced(3, 1, 0, 0);
+                list->EndQuery(queries.p, D3D12_QUERY_TYPE_OCCLUSION, query);
+            };
+            std::fprintf(stderr, "D3D-604 original query batch\n");
             for (UINT targets = 0; targets <= 1; ++targets) {
                 list->SetPipelineState(targets ? fullscreen.p : occlusion_pso.p);
                 list->OMSetRenderTargets(targets, targets ? &rtv : nullptr, FALSE, nullptr);
-                for (UINT i = 0; i < case_count; ++i) {
-                    const UINT query = targets * case_count + i;
-                    list->RSSetViewports(1, &cases[i].viewport);
-                    list->RSSetScissorRects(1, &cases[i].scissor);
-                    list->BeginQuery(queries.p, D3D12_QUERY_TYPE_OCCLUSION, query);
-                    list->DrawInstanced(3, 1, 0, 0);
-                    list->EndQuery(queries.p, D3D12_QUERY_TYPE_OCCLUSION, query);
-                }
+                for (UINT i = 0; i < case_count; ++i) record_case(i, targets * case_count + i);
             }
             list->ResolveQueryData(queries.p, D3D12_QUERY_TYPE_OCCLUSION, 0, query_desc.Count, readback.p, 0);
             EXPECT(SUCCEEDED(list->Close()));
@@ -1058,12 +1059,71 @@ int main() {
             EXPECT(SUCCEEDED(queue->Signal(fence.p, 100)) && SUCCEEDED(fence->SetEventOnCompletion(100, nullptr)));
             std::array<UINT64, 2 * case_count> samples{};
             std::memcpy(samples.data(), mapped, sizeof(samples));
+
+            // Repeat the RTV batch, keeping each query paired with a snapshot of that draw on a blue background.
+            // Each snapshot occupies a disjoint, 512-byte-aligned footprint in a separate readback buffer.
+            constexpr UINT row_pitch = 256;
+            constexpr UINT64 image_bytes = size * row_pitch;
+            static_assert(size * 4 <= row_pitch && image_bytes % 512 == 0);
+            Ref<ID3D12Resource> images;
+            const auto images_desc = buffer_desc(case_count * image_bytes);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &images_desc,
+                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&images.p))));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, fullscreen.p)));
+            list->SetGraphicsRootSignature(root.p);
+            list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            D3D12_TEXTURE_COPY_LOCATION image_src{color.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            D3D12_TEXTURE_COPY_LOCATION image_dst{images.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            image_dst.PlacedFootprint.Footprint = {rt_desc.Format, size, size, 1, row_pitch};
+            const auto to_src = transition(color.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            const auto to_rtv = transition(color.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            std::fprintf(stderr, "D3D-604 RTV query and color readback batch\n");
+            for (UINT i = 0; i < case_count; ++i) {
+                list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+                record_case(i, i);
+                list->ResourceBarrier(1, &to_src);
+                image_dst.PlacedFootprint.Offset = i * image_bytes;
+                list->CopyTextureRegion(&image_dst, 0, 0, 0, &image_src, nullptr);
+                list->ResourceBarrier(1, &to_rtv);
+            }
+            list->ResolveQueryData(queries.p, D3D12_QUERY_TYPE_OCCLUSION, 0, case_count, readback.p, 0);
+            EXPECT(SUCCEEDED(list->Close()));
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 101)) && SUCCEEDED(fence->SetEventOnCompletion(101, nullptr)));
+            std::array<UINT64, case_count> color_samples{};
+            std::memcpy(color_samples.data(), mapped, sizeof(color_samples));
+            void* image_data = nullptr;
+            EXPECT(SUCCEEDED(images->Map(0, nullptr, &image_data)));
+            // A bit represents (x + 4*y) in the upper-left 4x4. All remaining pixels must stay blue.
+            constexpr unsigned expected_mask[] = {0x0033, 0x0001, 0x0003, 0, 0, 0x0033, 0x0060};
+            static_assert(std::size(expected_mask) == case_count);
             unsigned mismatches = 0;
             for (UINT i = 0; i < case_count; ++i) {
-                std::printf("viewport %u: %llu samples without RTV, %llu with RTV (expected %llu)\n",
-                            i, samples[i], samples[case_count + i], cases[i].samples);
+                unsigned red = 0, mask = 0, other = 0;
+                const auto* image = static_cast<const std::uint8_t*>(image_data) + i * image_bytes;
+                for (UINT y = 0; y < size; ++y) {
+                    for (UINT x = 0; x < size; ++x) {
+                        const auto* p = image + y * row_pitch + 4 * x;
+                        if (p[0] == 255 && p[1] == 0 && p[2] == 0 && p[3] == 255) {
+                            ++red;
+                            if (x < 4 && y < 4) mask |= 1u << (x + 4 * y);
+                        } else if (p[0] != 0 || p[1] != 0 || p[2] != 255 || p[3] != 255) {
+                            ++other;
+                        }
+                    }
+                }
+                std::printf("viewport %u: original no RTV/RTV %llu/%llu, repeat RTV query %llu, "
+                            "red pixels %u, mask %04x, other colors %u (expected %llu, mask %04x)\n",
+                            i, samples[i], samples[case_count + i], color_samples[i], red, mask, other,
+                            cases[i].samples, expected_mask[i]);
                 mismatches += samples[i] != cases[i].samples || samples[case_count + i] != cases[i].samples;
+                mismatches += color_samples[i] != cases[i].samples || red != cases[i].samples ||
+                              mask != expected_mask[i] || other != 0;
             }
+            images->Unmap(0, nullptr);
             EXPECT(mismatches == 0);
         }
 

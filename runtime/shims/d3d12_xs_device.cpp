@@ -1443,8 +1443,7 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
 // CreateSampler. The PC slot 61 is CreateMetaCommand, which would take these words as (CommandId, NodeMask, ...).
 // HYPOTHESIS: the console description begins with the PC D3D12_SAMPLER_DESC (52 bytes), which is what got the title
 // past this call; whatever follows it is not known and not read. The title was not seen testing a result, so a null
-// description is skipped rather than reported. The handle is passed as given: a handle in the title's own heap range
-// is #7021's translation.
+// description is skipped rather than reported. Translate a destination from a title-allocated heap before the PC write.
 void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, std::uint64_t dest) {
     note_slot(61);
     if (!desc) {
@@ -1453,9 +1452,7 @@ void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, s
             std::fprintf(stderr, "[rt] d3d12_xs: slot 61 CreateSamplerX without a description (skipped)\n");
         return;
     }
-    D3D12_CPU_DESCRIPTOR_HANDLE handle{};
-    handle.ptr = static_cast<SIZE_T>(dest);
-    self->real->CreateSampler(desc, handle);
+    self->real->CreateSampler(desc, translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(dest)}));
 }
 
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named

@@ -825,6 +825,21 @@ int check_descriptor_heap_hooks() {
     EXPECT(oom_heap == nullptr && g_heap_hook.free_calls == 3);
     EXPECT(xs::translate_cpu_descriptor_handle(device, D3D12_CPU_DESCRIPTOR_HANDLE{kCustomBase}).ptr == kCustomBase);
 
+    // The console sampler writer receives a title-owned handle with a descriptor offset.
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    void* sampler_heap = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&desc), word(&iid_heap), word(&sampler_heap)))));
+    EXPECT(sampler_heap && raw(sampler_heap, 9) == kCustomBase);
+    D3D12_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    const auto writes = real->calls[22];
+    raw(device, 61, word(&sampler), kCustomBase + off3);
+    EXPECT(real->calls[22] == writes + 1 && real->calls[61] == 0);
+    EXPECT(real->args[22][0] == word(&sampler) && real->args[22][1] == kMockHeapCpuStart + off3);
+    EXPECT(release(sampler_heap) == 0 && g_heap_hook.free_calls == 4);
+
     EXPECT(raw(device, 2) == 0 && real->refs == 0);
     xs::set_descriptor_heap_allocator(nullptr, nullptr);
     return 0;

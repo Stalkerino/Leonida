@@ -235,12 +235,59 @@ class RuntimePackagingTest(unittest.TestCase):
                     self.assertIn("gta6rt.exe'", command)
                     self.assertIn("Player''s Test.exe'", command)
                 else:
-                    self.assertEqual(shlex.split(command.removeprefix("(").removesuffix(")")),
-                                     ["cd", self.game, "&&", os.path.join(out, "gta6rt.sh"), "--dry-run", "./" + image])
+                    self.assertEqual(shlex.split(command), [os.path.join(out, "gta6rt.sh"), "--dry-run"])
                 os.remove(path)
                 make_game.runtime(self.game, out, {"expected_exe": image}, self.build)
                 self.assertIn("is missing", log.call_args.args[0])
                 self.assertNotIn("--dry-run", log.call_args.args[0])
+
+    @unittest.skipIf(os.name == "nt", "executes the generated POSIX launcher")
+    def test_wine_first_boot_uses_the_packaged_game_and_shader_paths(self):
+        image = "Player's test.exe"
+        work = os.path.join(self.root, "Shader cache '$HOME'")
+        self.write_artifact("gta6rt_tls_host.dll", b"")
+        self.write_artifact("gta6rt.exe", b"import os, sys, json\n"
+                            b"print(json.dumps([os.getcwd(), sys.argv[1:], os.getenv('LEONIDA_SHADERS'), "
+                            b"os.getenv('LEONIDA_D3D12')]))\n")
+        make_game.runtime(self.game, self.out, {"expected_exe": image}, self.build, work=work)
+        launcher = os.path.join(self.out, "gta6rt.sh")
+        env = dict(os.environ, WINE=sys.executable)
+        env.pop("LEONIDA_D3D12", None)
+        env.pop("LEONIDA_SHADERS", None)
+        missing = subprocess.run([launcher, "--run"], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn(image, missing.stderr)
+        with open(os.path.join(self.game, image), "wb"):
+            pass
+        for mode in ("--dry-run", "--init"):
+            with self.subTest(mode=mode):
+                result = subprocess.check_output([launcher, mode], cwd=self.root, env=env)
+                self.assertEqual(json.loads(result), [
+                    self.game, [mode, "./" + image, "--overlay", "Z:" + self.out + "/overlay"],
+                    None, "vulkan",
+                ])
+        env.update(LEONIDA_SHADERS="D:/custom", LEONIDA_D3D12="trace")
+        result = subprocess.check_output([launcher, "--run"], cwd=self.root, env=env)
+        self.assertEqual(json.loads(result)[2:], ["D:/custom", "trace"])
+        result = subprocess.check_output([launcher, "--run", "other.exe", "--", "two words"], cwd=self.root, env=env)
+        self.assertEqual(json.loads(result)[:2], [self.root, ["--run", "other.exe", "--", "two words"]])
+
+        work = os.path.join(self.out, "Shader cache '$HOME'")
+        make_game.runtime(self.game, self.out, {"expected_exe": image}, self.build, work=work)
+        moved = self.out + " moved"
+        os.rename(self.out, moved)
+        env.pop("LEONIDA_SHADERS")
+        result = subprocess.check_output([os.path.join(moved, "gta6rt.sh"), "--dry-run"], cwd=self.root, env=env)
+        self.assertEqual(json.loads(result)[2], "Z:" + moved + "/Shader cache '$HOME'/shaders/spirv")
+
+    def test_runtime_records_shader_work_directory(self):
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+        work = os.path.join(self.root, "Shader Work \u03bb")
+        with mock.patch.object(make_game, "log"):
+            make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"}, self.build, work=work)
+        with open(os.path.join(self.out, "shader_path.txt"), "rb") as f:
+            recorded = f.read()
+        self.assertEqual(recorded, os.fsencode(os.path.join(work, "shaders", "spirv")))
 
     def package(self):
         with mock.patch.object(make_game.os, "name", "nt"), \
@@ -269,6 +316,32 @@ class RuntimePackagingTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("gta6rt_tls_host.dll", err.getvalue())
         self.assertFalse(os.path.exists(self.out))
+
+    def test_runtime_build_starts_powershell_by_its_full_path(self):
+        # The stage started "powershell" by name. CreateProcess searches System32 but not
+        # System32\WindowsPowerShell\v1.0, so on a PC whose PATH had lost that folder the stage ended in a
+        # FileNotFoundError traceback after the earlier stages had run.
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+        system_root = os.path.join(self.root, "Windows")
+        folder = os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0")
+        os.makedirs(folder)
+        exe = os.path.join(folder, "powershell.exe")
+        with open(exe, "wb"):
+            pass
+        with mock.patch.object(make_game.os, "name", "nt"), \
+                mock.patch.object(make_game, "ROOT", self.root), \
+                mock.patch.dict(os.environ, {"SystemRoot": system_root, "PATH": ""}), \
+                mock.patch.object(make_game, "run") as run, \
+                mock.patch.object(make_game, "log"):
+            make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"})
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], exe)
+        self.assertIn(os.path.join(self.root, "scripts", "build_runtime.ps1"), command)
+
+    def test_powershell_is_the_bare_name_where_the_file_is_not_at_its_usual_place(self):
+        with mock.patch.dict(os.environ, {"SystemRoot": os.path.join(self.root, "nowhere")}):
+            self.assertEqual(make_game.windows_powershell(), "powershell")
 
 
 class ConfiguredCrossToolsTest(unittest.TestCase):
@@ -431,9 +504,19 @@ class PipelineCheckExeTest(unittest.TestCase):
     def test_linux_prefers_the_readme_build_folder(self):
         self.assertIsNone(self.exe("posix"))
         plain = self.touch("vk_pipeline_check")
+        os.chmod(plain, 0o755)
         self.assertEqual(self.exe("posix"), plain)
         readme = self.touch("linux", "vk_pipeline_check")
+        os.chmod(readme, 0o755)
         self.assertEqual(self.exe("posix"), readme)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX execute permissions")
+    def test_non_executable_linux_checker_does_not_hide_the_fallback(self):
+        preferred = self.touch("linux", "vk_pipeline_check")
+        os.chmod(preferred, 0o644)
+        fallback = self.touch("vk_pipeline_check")
+        os.chmod(fallback, 0o755)
+        self.assertEqual(self.exe("posix"), fallback)
 
     def test_windows_finds_only_the_exe(self):
         self.touch("linux", "vk_pipeline_check")
@@ -452,6 +535,7 @@ class PipelineCheckExeTest(unittest.TestCase):
 
     def test_pipelines_off_windows_runs_the_linux_build(self):
         exe = self.touch("linux", "vk_pipeline_check")
+        os.chmod(exe, 0o755)
         self.touch("vk_pipeline_check.exe")
         work = os.path.join(self.tmp.name, "work")
         os.makedirs(os.path.join(work, "shaders", "spirv"))

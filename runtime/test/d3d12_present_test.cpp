@@ -8,6 +8,7 @@
 // so the swapchain checks confirm the colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
+#include "window_station.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
@@ -15,6 +16,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <string_view>
 #include <vector>
@@ -69,6 +71,50 @@ bool is_hdr_monitor(HWND window) {
     return false;
 }
 
+// The LUID of the DXGI adapter whose output shows the window's monitor, or false when it cannot be told. A Vulkan
+// swapchain made on another adapter (a render-only GPU, such as an Intel iGPU with no monitor attached while the
+// desktop runs on a discrete GPU) is not shown by the desktop compositor at all: a bare vkCreateSwapchainKHR + clear +
+// vkQueuePresentKHR program on the UHD 770 leaves the window's own white background on screen, and GDI, BitBlt with
+// CAPTUREBLT and PrintWindow all read that white, while the same program on the display GPU reads the clear colour.
+bool display_adapter_luid(HWND window, LUID* luid) {
+    const HMONITOR target = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    if (!target) return false;
+    Ref<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return false;
+    for (UINT i = 0;; ++i) {
+        Ref<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(i, &adapter.p) == DXGI_ERROR_NOT_FOUND) break;
+        if (!adapter.p) continue;
+        for (UINT j = 0;; ++j) {
+            Ref<IDXGIOutput> output;
+            if (adapter->EnumOutputs(j, &output.p) == DXGI_ERROR_NOT_FOUND) break;
+            if (!output.p) continue;
+            DXGI_OUTPUT_DESC desc{};
+            DXGI_ADAPTER_DESC1 adapter_desc{};
+            if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == target &&
+                SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
+                *luid = adapter_desc.AdapterLuid;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// True when the Vulkan device is known to be a different adapter from the one driving the window's monitor.
+bool device_is_not_display_adapter(const vktest::Device& d, HWND window) {
+    LUID display{};
+    if (!display_adapter_luid(window, &display)) return false;
+    const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+        d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties2"));
+    if (!properties2) return false;
+    VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+    properties2(d.physical, &properties);
+    if (!id.deviceLUIDValid) return false;
+    return std::memcmp(id.deviceLUID, &display, sizeof(LUID)) != 0;
+}
+
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
     return DefWindowProcW(window, message, w, l);
 }
@@ -79,15 +125,6 @@ void pump() {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-}
-
-bool has_interactive_window_station() {
-    HWINSTA station = GetProcessWindowStation();
-    if (!station) return true;  // Unknown environment: let window creation report the real failure.
-    USEROBJECTFLAGS flags{};
-    DWORD bytes = 0;
-    if (!GetUserObjectInformationW(station, UOI_FLAGS, &flags, sizeof(flags), &bytes)) return true;
-    return (flags.dwFlags & WSF_VISIBLE) != 0;
 }
 
 // True when the window manager reports this window as the top-level window at a screen point. Being the foreground
@@ -526,8 +563,15 @@ int main() {
                     if (reads > 1)
                         std::printf("read %d times, 50 ms apart; the first read was %d,%d,%d\n", reads,
                                     GetRValue(first_pixel), GetGValue(first_pixel), GetBValue(first_pixel));
-                    EXPECT(is_clear_colour(pixel));
-                    screen_checked = true;
+                    if (device_is_not_display_adapter(d, window)) {
+                        // The pixel is what the desktop shows, and the desktop does not show this GPU's swapchain.
+                        std::printf("the Vulkan device is not the adapter that drives this monitor: the desktop does "
+                                    "not show its swapchain, on-screen colour check skipped, the colour was checked "
+                                    "in the presented images\n");
+                    } else {
+                        EXPECT(is_clear_colour(pixel));
+                        screen_checked = true;
+                    }
                 }
             }
         } else {

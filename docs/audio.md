@@ -55,7 +55,9 @@ The exporters use three tag types:
 
 `tools/rsc8_audio.py` additionally decodes the speech companions `0x36` (peaks), `0xa3` (seek
 table), `0xb2` (loudness), `0xbd` (cue records) and the two structural tags below; every other tag type
-is skipped.
+is skipped. The `0xbd` record layout is in [rsc8_audio.md](rsc8_audio.md#the-0xbd-cue-records); the music banks
+have the tag too (945 tags in 938 of the 3,008 streamed-music banks, counted by `tools/awc_markers.py`), and
+what their records mark is in [audio_config.md](audio_config.md#marker-events-awc-tag-0xbd).
 
 | Tag | Meaning |
 |---|---|
@@ -208,7 +210,8 @@ programming is assembled by the game from many assets, so a lone AWC is rarely a
 
 The music/radio **config table** is a separate structure: 1,589 records with exact durations, AWC stream ids,
 contiguous station grouping and no per-track start offsets. See [audio_config.md](audio_config.md) for the record
-layout and the station-content references.
+layout, the station-content references and the marker events (tag `0xBD`) that mark track boundaries in five
+long mixes.
 
 ## Mission music: Home Sweet Home
 
@@ -347,6 +350,10 @@ Subtitle markup (`~n~`, `~sl:...~`, `~COLOR_...~` and other `~...~` tokens) beco
 out. A file is matched by its stream id and its bank: the folder below the Opus folder, or that path with leading
 folders removed, so one Opus folder can hold several archives' exports. `--source` limits the names to one source
 label of the names CSV.
+
+Dialogue wave names are matched without case. Repeated rows are accepted when they produce identical tags,
+including after subtitle markup is removed. Conflicting labels, speakers or subtitles stop the pass with a CSV
+line diagnostic before any Ogg file is modified; this also applies to `--dry-run`.
 
 ```sh
 python -I tools/opus_tags.py <work>/assets/audio/ogg --names <temp>/awc_names.csv --dialogue <temp>/dialogue.csv

@@ -64,7 +64,7 @@ These need no game files and run in seconds:
 ```powershell
 python -m compileall -q make_game.py tools tests
 python -I make_game.py --help
-python -m unittest discover -s tests/semantic -v   # translator regression suite; no LLVM, SPIR-V tools or GPU needed
+python -I scripts/run_semantic_tests.py tests/semantic   # translator regression suite, one file per core; no LLVM, SPIR-V tools or GPU needed
 python -I tests/test_<name>.py                     # standalone standard-library unit test
 node --test tests/test_viewer_streaming.cjs        # viewer streaming; needs Node 22+
 dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
@@ -95,7 +95,7 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
 
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise; the exceptions
   are the texture and model tools that import numpy or Pillow: `bc_feature.py`, `amd_swizzle.py`, `tile_probe.py`,
-  `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `calibrated_texture.py`, `tex_headers.py` and
-  `skinned_glb.py` (which fall back to the standard library when numpy is absent).
+  `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `calibrated_texture.py`, `world_grid_atlas.py`,
+  `tex_headers.py` and `skinned_glb.py` (which fall back to the standard library when numpy is absent).
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.
 - In the pull request, say that it was AI-assisted, what you tested and on which GPU and driver.

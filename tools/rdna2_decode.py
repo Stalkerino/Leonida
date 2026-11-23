@@ -16,6 +16,8 @@ import json
 import os
 import struct
 import sys
+from collections.abc import Iterator
+from io import StringIO
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -392,6 +394,10 @@ def _mimg_data_count(name: str, dmask: int, d16: bool, tfe: bool) -> int:
     if name in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
         return 4
     if name.startswith("image_atomic_"):
+        # The GFX10 atomic dmask selects the total VDATA width, including
+        # both compare and swap values for cmpswap (masks 0x3 and 0xf).
+        if dmask in (1, 3, 15):
+            return dmask.bit_count()
         n = 2 if "cmpswap" in name else 1
         if name.endswith("_x2"):
             n *= 2
@@ -405,7 +411,7 @@ def _mimg_data_count(name: str, dmask: int, d16: bool, tfe: bool) -> int:
     return n + (1 if tfe else 0)
 
 
-def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
+def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | None, int]:
     """Decode one RDNA2 instruction at byte offset `pc`. Returns (ins_dict_or_None, byte_length)."""
     if pc + 4 > len(code):
         return None, len(code) - pc
@@ -878,32 +884,31 @@ def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
                 return None, 4
             lit = struct.unpack_from("<I", code, pc + 8)[0]
             nbytes = 12
+        is_mix = name.startswith("v_fma_mix")
         args = []
         for fn, nr, _ in spec:
             w = _width(nr, wave32)
             if fn == "VDST":
                 args.append(_vreg(vdst, w))
-            elif fn == "SRC0":
-                args.append(_src(src0, w, lit))
-            elif fn == "SRC1":
-                args.append(_src(src1, w, lit))
-            elif fn == "SRC2":
-                args.append(_src(src2, w, lit))
+            elif fn in ("SRC0", "SRC1", "SRC2"):
+                idx = int(fn[-1])
+                args.append(_src(srcs_codes[idx], w, lit,
+                                 neg=is_mix and bool(neg_lo & (1 << idx)),
+                                 absm=is_mix and bool(neg_hi & (1 << idx))))
         mods = []
         sel_bits = [(op_sel >> i) & 1 for i in range(nsrc)]
         selhi_bits = [(op_sel_hi >> i) & 1 for i in range(nsrc)]
         neglo_bits = [(neg_lo >> i) & 1 for i in range(nsrc)]
         neghi_bits = [(neg_hi >> i) & 1 for i in range(nsrc)]
         # v_fma_mix* uses op_sel/op_sel_hi with default [0,...]; standard packed ops default op_sel_hi to [1,...].
-        is_mix = name.startswith("v_fma_mix")
         if any(sel_bits):
             mods.append(f"op_sel:[{','.join(str(b) for b in sel_bits)}]")
         default_hi = [0] * nsrc if is_mix else [1] * nsrc
         if selhi_bits != default_hi:
             mods.append(f"op_sel_hi:[{','.join(str(b) for b in selhi_bits)}]")
-        if any(neglo_bits):
+        if not is_mix and any(neglo_bits):
             mods.append(f"neg_lo:[{','.join(str(b) for b in neglo_bits)}]")
-        if any(neghi_bits):
+        if not is_mix and any(neghi_bits):
             mods.append(f"neg_hi:[{','.join(str(b) for b in neghi_bits)}]")
         if clamp:
             mods.append("clamp")
@@ -923,6 +928,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
         if entry is None:
             return None, 4
         name, spec = entry
+        if opc == 0x140 and mcpu.startswith("gfx101"):
+            name = "v_mad_legacy_f32"
         sdst = (w0 >> 8) & 0x7F
         abs_bits = 0 if is_vop3b else ((w0 >> 8) & 7)
         op_sel = 0 if is_vop3b else ((w0 >> 11) & 0xF)
@@ -1196,7 +1203,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool) -> tuple[dict | None, int]:
         vdata = (w1 >> 8) & 0xFF
         srsrc = ((w1 >> 16) & 0x1F) * 4
         ssamp = ((w1 >> 21) & 0x1F) * 4
-        slc = (w1 >> 25) & 1
+        slc = (w0 >> 25) & 1
         a16 = (w1 >> 30) & 1
         d16 = (w1 >> 31) & 1
         entry = T.MIMG.get(opc)
@@ -1394,25 +1401,41 @@ def format_insn(ins: dict) -> str:
     return f"\t{head:<40s}; encoding: [{enc_str}]"
 
 
-def decode_bytes(code: bytes, *, wave32: bool = True, code_start: int = 0, name: str = "") -> dict:
+def _iter_insns(code: bytes, wave32: bool, code_start: int, mcpu: str) -> Iterator[dict | None]:
+    """Yield each decoded instruction, or None for each invalid word counted."""
+    off = 0
+    while off < len(code):
+        ins, nbytes = _decode_one(code, off, wave32, mcpu)
+        if ins is None:
+            off += max(4, nbytes)
+        else:
+            ins["pc"] = code_start + off
+            off += nbytes
+        yield ins
+
+
+def decode_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> dict:
     """Decode raw RDNA2 machine code into the exact dict layout `shader_ir.parse_file()` returns."""
     insns = []
     invalid = 0
-    off = 0
-    while off < len(code):
-        ins, nbytes = _decode_one(code, off, wave32)
+    for ins in _iter_insns(code, wave32, code_start, mcpu):
         if ins is None:
             invalid += 1
-            off += max(4, nbytes)
-            continue
-        ins["pc"] = code_start + off
-        insns.append(ins)
-        off += nbytes
+        else:
+            insns.append(ins)
     return {"name": name, "code_start": code_start, "insns": insns, "invalid": invalid}
 
 
-def disasm_bytes(code: bytes, *, wave32: bool = True, code_start: int = 0, name: str = "") -> tuple[str, int]:
-    """Decode raw RDNA2 machine code into `(llvm_compatible_text, invalid_word_count)`."""
-    info = decode_bytes(code, wave32=wave32, code_start=code_start, name=name)
-    lines = [format_insn(ins) for ins in info["insns"]]
-    return "\n".join(lines) + ("\n" if lines else ""), info["invalid"]
+def disasm_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> tuple[str, int]:
+    """Decode raw RDNA2 machine code into `(llvm_compatible_text, invalid_word_count)`.
+
+    The listing contains only instructions. `name` is accepted for caller compatibility.
+    """
+    invalid = 0
+    with StringIO() as listing:
+        for ins in _iter_insns(code, wave32, code_start, mcpu):
+            if ins is None:
+                invalid += 1
+            else:
+                listing.write(f"{format_insn(ins)}\n")
+        return listing.getvalue(), invalid

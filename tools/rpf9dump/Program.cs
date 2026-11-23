@@ -5,7 +5,11 @@ using System.Globalization;
 using System.Text.Json;
 using RpfPreview.Core;
 
-if (args.Length < 3) { Console.WriteLine("usage: rpf9dump ttpf|models|textures <source> <outdir> [--start BYTES] [--length BYTES]"); return 2; }
+// The mode is checked before the source or the output folder is touched. A typo used to fall through every branch:
+// it created the output folder, printed ok=0 fail=0 skip=0 and exited 0, which make_game reads as a finished stage.
+string[] modes = ["ttpf", "audio", "xma", "models", "textures"];
+if (args.Length < 3) { Usage(); return 2; }
+if (!modes.Contains(args[0])) { Console.Error.WriteLine($"unknown mode '{args[0]}'"); Usage(); return 2; }
 string mode = args[0], src = Path.GetFullPath(args[1]), outRoot = Path.GetFullPath(args[2]);
 // --start/--length scan one window of the file instead of the whole archive. A window is a raw slice of an
 // archive (`levels.rpf` cut at an offset), so it need not carry the file's header and it is not an
@@ -29,11 +33,20 @@ if (window && mode is not ("models" or "textures"))
     Console.WriteLine("--start/--length apply to models and textures; other modes need a recognized archive.");
     return 2;
 }
+// A missing source, or a directory passed as one, is a usage error. Check it before the output folder is
+// created: FileInfo.Length would otherwise throw after <out>/<name> already exists.
+if (!File.Exists(src)) { Console.Error.WriteLine($"source is not a file: {src}"); return 2; }
+long length = new FileInfo(src).Length;
+if (window && scanStart > length)
+{
+    Console.Error.WriteLine($"--start ({scanStart}) exceeds source length ({length}).");
+    return 2;
+}
+long? effectiveScanLength = scanLength is long reqSpan ? Math.Min(reqSpan, length - scanStart) : null;
 var json = new JsonSerializerOptions { WriteIndented = true };
 var sw = Stopwatch.StartNew();
 string baseName = Path.GetFileNameWithoutExtension(src);
 string outDir = Path.Combine(outRoot, baseName); Directory.CreateDirectory(outDir);
-long length = new FileInfo(src).Length;
 int ok = 0, fail = 0, skip = 0, writeFail = 0;
 // Every mode below works on all cores. Core's readers open their own read handle per call, entry and file names
 // come from offsets and indexes, and results are put back in source order, so outputs match a one-thread run.
@@ -138,14 +151,14 @@ else if (mode is "models" or "textures")
     if (window)
     {
         // A sub-range is never cached: the index cache is keyed by the file, not by the window inside it.
-        var cands = Scan(src, scanStart, scanLength);
+        var cands = Scan(src, scanStart, effectiveScanLength);
         candidates = cands.Count;
         list = Recover(src, length, cands);
         Console.WriteLine("  a window is scanned again on every run: no index cache is written");
     }
     else
     {
-        byte[] header; using (var f = File.OpenRead(src)) { header = new byte[64]; f.ReadExactly(header); }
+        byte[] header; using (var f = File.OpenRead(src)) { header = new byte[(int)Math.Min(64, length)]; f.ReadExactly(header); }
         var cached = RecoveryIndexCache.Load(mode, src, length, header);
         // A partial index (rpf9-explorer stopped or still indexing) would export only part of the archive: scan again.
         if (cached != null && !ScanCounts.IsFullScan(cached)) { Console.WriteLine($"  cached {mode} index is not marked as a full scan ({cached.Entries.Count:N0} entries), rescanning"); cached = null; }
@@ -223,7 +236,7 @@ else if (mode is "models" or "textures")
     {
         // Which slice of the file this manifest covers, so a later run can name the same window.
         writer.WriteNumber("Start", scanStart);
-        writer.WriteNumber("Length", scanLength ?? (length - scanStart));
+        writer.WriteNumber("Length", effectiveScanLength ?? (length - scanStart));
     }
     writer.WriteEndObject();
     writer.WriteStartArray("Items");
@@ -373,6 +386,16 @@ static void WithdrawMarker(string path)
     if (!File.Exists(path)) return;
     try { File.SetAttributes(path, FileAttributes.Normal); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     File.Delete(path);
+}
+
+static void Usage()
+{
+    Console.WriteLine("usage: rpf9dump <mode> <source> <outdir> [--start BYTES] [--length BYTES]");
+    Console.WriteLine("  ttpf      texture dictionaries and world texture pools as DDS");
+    Console.WriteLine("  models    drawable models as OBJ, with their embedded textures");
+    Console.WriteLine("  textures  texture dictionaries as DDS");
+    Console.WriteLine("  audio     AWC banks whole, plus audio_manifest.json");
+    Console.WriteLine("  xma       XMA2 streams as RIFF XMA2 .wav for ffmpeg");
 }
 
 // One exported entry: its manifest row (null when nothing was written), counts, a failure to report in order,

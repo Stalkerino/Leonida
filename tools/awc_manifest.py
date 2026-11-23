@@ -20,6 +20,7 @@ look inconsistent (zero/odd rate, data-size mismatch, implausible duration).
 A streamed-music descriptor contributes one row per channel group; `channels` is the packet channel count read
 from the Opus TOC stereo bit, and `declared_samples`/`duration_s` are per channel (the descriptor stores the
 interleaved count). `data_offset`/`size` is the shared data tag.
+Usage: `python -I tools/awc_manifest.py --help` lists the options.
 """
 import argparse
 import csv
@@ -155,8 +156,11 @@ def collect(src: str, *, out: str | None = None):
     """
     recursive = os.path.isdir(src)
     if recursive:
+        def scan_failed(error):
+            raise error
+
         banks = []
-        for root, dirs, files in os.walk(src):
+        for root, dirs, files in os.walk(src, onerror=scan_failed):
             dirs.sort()
             banks += [os.path.join(root, f) for f in files if f.lower().endswith(".awc")]
         banks.sort(key=lambda p: (os.path.basename(p).lower(), p.lower()))
@@ -213,6 +217,12 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
         if f is not sys.stdout:
             f.close()
         if tmp:
+            # The staging file may have inherited a read-only destination's mode; make it deletable
+            # first, or Windows strands it beside the manifest when the replace fails.
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             try:
                 os.unlink(tmp)
             except OSError:

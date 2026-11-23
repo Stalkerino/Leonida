@@ -39,9 +39,9 @@ def select_rows(rows, center, radius, limit):
         dx, dy = row["_pos"][0] - cx, row["_pos"][1] - cy
         d = math.hypot(dx, dy)
         if d <= radius:
-            near.append((d, row))
-    near.sort(key=lambda t: t[0])
-    return [row for _, row in near[:limit]]
+            near.append(row)
+    near.sort(key=lambda row: math.hypot(row["_pos"][0] - cx, row["_pos"][1] - cy))
+    return near if limit is None or limit >= len(near) else near[:limit]
 
 
 def draw_rows(rotation, scale_xy, scale_z, position):
@@ -94,7 +94,9 @@ def build(args):
             raise SystemExit("no entity resolves to an exported model")
         best = max(cells, key=cells.get)
         args.center = [(best[0] + 0.5) * 50, (best[1] + 0.5) * 50]
-    picked = select_rows(rows, args.center, args.radius, args.max_props * 4)
+    # Missing models or empty geometry must not exhaust a positive placement budget.
+    candidate_limit = len(rows) if args.max_props > 0 else args.max_props * 4
+    picked = select_rows(rows, args.center, args.radius, candidate_limit)
 
     textures, tex_ids = [], {}
     meshes, mesh_ids = [], {}
@@ -167,7 +169,16 @@ def main(argv=None):
     ap.add_argument("--max-props", type=int, default=400, help="entities to place, nearest first (each can be several draws)")
     ap.add_argument("--tex-size", type=int, default=256)
     ap.add_argument("--out", required=True)
-    stats = build(ap.parse_args(argv))
+    args = ap.parse_args(argv)
+    if os.path.isdir(args.out):
+        print(f"ERROR: --out is a folder, not a scene file: {args.out}", file=sys.stderr)
+        return 2
+    try:
+        stats = build(args)
+    except OSError as e:
+        # An unreadable --entities/--models or an unwritable --out used to end in a traceback.
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     print(" ".join(f"{k}={v}" for k, v in stats.items()))
     return 0
 

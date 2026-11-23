@@ -1,0 +1,16 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 32) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint words[];
+};
+layout(push_constant, std430) uniform Input {
+    Words placed;
+} input_data;
+
+void main() {
+    uint page = gl_GlobalInvocationID.x;
+    uint start = page * 16384u;
+    input_data.placed.words[start + 1u] = input_data.placed.words[start] ^ 0x5fa9142bu;
+}

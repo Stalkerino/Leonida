@@ -1078,6 +1078,22 @@ if(TARGET Vulkan::Headers)
   # readbacks against the GPU halves. Windows only (VirtualAlloc2/MapViewOfFile3).
   if(WIN32)
     add_executable(vk_xbox_physical_test test/vk_xbox_physical_test.cpp)
+    set(LEONIDA_XMEM_SHIMS_DIR "" CACHE PATH "Optional public #6919 runtime/shims for the physical buffer acceptance test")
+    if(LEONIDA_XMEM_SHIMS_DIR)
+      find_program(LEONIDA_PAGE_TEST_GLSLANG NAMES glslangValidator REQUIRED)
+      set(page_marker_header "${CMAKE_CURRENT_BINARY_DIR}/generated/xmem_page_markers.h")
+      add_custom_command(OUTPUT "${page_marker_header}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${LEONIDA_PAGE_TEST_GLSLANG}" -V --target-env vulkan1.2 --vn xmem_page_markers
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/xmem_page_markers.comp" -o "${page_marker_header}"
+        DEPENDS test/glsl/xmem_page_markers.comp VERBATIM)
+      target_sources(vk_xbox_physical_test PRIVATE "${page_marker_header}"
+        "${LEONIDA_XMEM_SHIMS_DIR}/xmem.cpp" "${LEONIDA_XMEM_SHIMS_DIR}/registry.cpp")
+      target_include_directories(vk_xbox_physical_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated" "${LEONIDA_XMEM_SHIMS_DIR}")
+      target_compile_definitions(vk_xbox_physical_test PRIVATE LEONIDA_XMEM_PAGE_MARKERS=1)
+      target_link_libraries(vk_xbox_physical_test PRIVATE psapi)
+      target_link_options(vk_xbox_physical_test PRIVATE /OPT:NOREF)
+    endif()
     target_link_libraries(vk_xbox_physical_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     target_compile_definitions(vk_xbox_physical_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     if(MSVC)

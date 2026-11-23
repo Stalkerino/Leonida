@@ -377,9 +377,10 @@ private:
 // The GPU half of physical pages: a PagePool page per physical page, created on first use, plus the copies that keep
 // the two halves coherent. Copies address a page through a plain buffer bound to its chunk's memory (memory may be
 // bound to a sparse arena page and to a plain buffer at once). One thread records with it.
+template<class Store = PhysicalPageStore>
 class PhysicalGpu {
 public:
-    PhysicalGpu(VkDevice device, PFN_vkGetDeviceProcAddr get, PagePool& pool, PhysicalPageStore& store,
+    PhysicalGpu(VkDevice device, PFN_vkGetDeviceProcAddr get, PagePool& pool, Store& store,
                 const VkPhysicalDeviceMemoryProperties& properties)
         : device_(device), pool_(pool), store_(store), properties_(properties) {
         create_buffer_ = reinterpret_cast<PFN_vkCreateBuffer>(get(device, "vkCreateBuffer"));
@@ -663,7 +664,7 @@ private:
 
     VkDevice device_;
     PagePool& pool_;
-    PhysicalPageStore& store_;
+    Store& store_;
     VkPhysicalDeviceMemoryProperties properties_;
     PFN_vkCreateBuffer create_buffer_ = nullptr;
     PFN_vkDestroyBuffer destroy_buffer_ = nullptr;

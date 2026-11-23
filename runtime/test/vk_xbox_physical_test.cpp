@@ -14,6 +14,10 @@
 #include "../src/vulkan_backend.h"
 #include "../src/xbox_paging.h"
 #include "../src/xbox_physical.h"
+#ifdef LEONIDA_XMEM_PAGE_MARKERS
+#include "shims.h"
+#include "xmem_page_markers.h"
+#endif
 
 #include <chrono>
 #include <cstdint>
@@ -124,7 +128,158 @@ bool all_bytes(const void* p, std::uint8_t value, std::size_t n) {
 
 }  // namespace
 
-int main() {
+#ifdef LEONIDA_XMEM_PAGE_MARKERS
+// Matches the measured 174 MiB, 2,784 distinct frames and three contiguous guest sub-windows. Window lengths
+// and physical ordering are synthetic. Reverse/interleave the three backing sections to catch an accidental
+// assumption that adjacent guest pages share an allocation or increasing file offsets.
+int check_retail_backing() {
+    constexpr std::uint32_t pages_per_window = 928, total = 3 * pages_per_window;
+    constexpr VkDeviceSize bytes = total * kPageSize;
+    constexpr std::uint32_t chunk = 32;
+    static_assert(total % chunk == 0 && bytes == 182452224);
+    using Allocate = BOOL(WINAPI*)(UINT64, UINT64*, UINT64*);
+    using Map = void*(WINAPI*)(void*, UINT64, const UINT64*);
+    using Reserve = void*(WINAPI*)(void*, SIZE_T, DWORD, UINT64, DWORD);
+    using Free = BOOL(WINAPI*)(UINT64, const UINT64*);
+    auto allocate = reinterpret_cast<Allocate>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    auto map = reinterpret_cast<Map>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    auto reserve = reinterpret_cast<Reserve>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    auto release = reinterpret_cast<Free>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    if (!allocate || !map || !reserve || !release) return 1;
+    vktest::Device d;
+    d.request_sparse = true;
+    d.request_buffer_device_address = true;
+    if (!d.create() || !d.sparse || !d.buffer_device_address ||
+        (d.families[d.family].queueFlags & (VK_QUEUE_SPARSE_BINDING_BIT | VK_QUEUE_COMPUTE_BIT)) !=
+        (VK_QUEUE_SPARSE_BINDING_BIT | VK_QUEUE_COMPUTE_BIT)) return 77;
+    std::vector<UINT64> frames(total), order(total);
+    std::uintptr_t base = 0x50000000;
+    for (unsigned w = 0; w < 3; ++w) {
+        UINT64 count = pages_per_window;
+        if (!allocate(0x280, &count, frames.data() + w * pages_per_window) || count != pages_per_window) return 1;
+    }
+    for (unsigned i = 0; i < total; ++i)
+        order[i] = frames[(i % 3) * pages_per_window + (pages_per_window - 1 - i / 3)];
+    for (unsigned w = 0; w < 3; ++w) {
+        auto* target = reinterpret_cast<void*>(base + w * pages_per_window * kPageSize);
+        if (reserve(target, pages_per_window * kPageSize, 0x20402000, 0x23, 0x2004) != target ||
+            map(target, pages_per_window, order.data() + w * pages_per_window) != target) return 1;
+    }
+    VkPhysicalDeviceMemoryProperties memory{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(d.physical, &memory);
+    VulkanContext context(d.device_proc, d.device, true);
+    VulkanQueue queue(context, d.queue, d.family);
+    if (!context.loaded() || !queue.ok()) return 1;
+    std::optional<PagePool> pool_storage;
+    PagedRegion region;
+    if (!region.create(d.device, d.device_proc, bytes)) return 1;
+    auto& pool = pool_storage.emplace(d.device, d.device_proc, pick_page_memory_type(memory, region.memory_type_bits()));
+    // All CPU writers are on this thread. There are no remaps until the last GPU fence/readback.
+    struct GuestPages {
+        std::map<PhysicalPage, std::uint8_t*> mapped;
+        bool allocated(PhysicalPage id) const { return mapped.contains(id); }
+        std::uint8_t* data(PhysicalPage id) const { return mapped.at(id); }
+        void mark_dirty(PhysicalPage) {}  // The fixture explicitly uploads every page in the working set.
+        bool exclusive(std::span<const PhysicalPage> ids, const std::function<void(std::size_t, std::uint8_t*)>& merge) {
+            for (auto id : ids) if (!allocated(id)) return false;
+            for (std::size_t i = 0; i < ids.size(); ++i) merge(i, data(ids[i]));
+            return true;
+        }
+    } store;
+    PhysicalGpu physical(d.device, d.device_proc, pool, store, memory);
+    if (!pool.ok() || !physical.ok()) return 1;
+    PageMapper mapper(region, pool);
+    Gpu gpu(d, context, queue);
+    std::vector<PhysicalPage> pinned(total);
+    std::vector<PageId> backing(total);
+    auto cpu = [=](unsigned index) { return reinterpret_cast<std::uint32_t*>(base + index * kPageSize); };
+    auto marker = [](unsigned page) { return 0xbec10409u + page * 2654435761u; };
+    for (unsigned i = 0; i < total; ++i) {
+        auto* words = cpu(i);
+        words[0] = marker(i);
+        words[1] = 0;
+        words[kPageSize / 4 - 1] = ~marker(i);
+        if (order[i] > UINT32_MAX) return 1;
+        pinned[i] = static_cast<PhysicalPage>(order[i]);
+        if (!pinned[i] || !store.mapped.emplace(pinned[i], reinterpret_cast<std::uint8_t*>(words)).second) return 1;
+        if (!(backing[i] = physical.gpu_page(pinned[i]))) return 1;
+    }
+    if (std::set<PhysicalPage>(pinned.begin(), pinned.end()).size() != total) return 1;
+    const auto handle = mapper.register_page_pool(std::move(backing));
+    const PageMappingRange all{PageRangeType::incrementing, total, 0};
+    const PageMappingBatch bind{0, &all, 1};
+    const BindQueue submit{queue.timeline(), [&](VkBuffer buffer, std::span<const VkSparseMemoryBind> binds,
+                                                 BindQueue::Submitted submitted) {
+        return queue.bind_sparse_ordered(buffer, binds, std::move(submitted));
+    }};
+    if (!mapper.copy_page_mappings_batch(handle, {&bind, 1}, submit)) return 1;
+    for (unsigned i = 0; i < total; i += chunk) {
+        const auto part = std::span<const PhysicalPage>(pinned).subspan(i, chunk);
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(physical.record_upload(cb, part)); }));
+        if (g_failures) return 1;
+    }
+    VkShaderModule module{};
+    VkShaderModuleCreateInfo shader{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    shader.pCode = xmem_page_markers;
+    shader.codeSize = sizeof(xmem_page_markers);
+    if (d.fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(d.device, &shader, nullptr, &module) != VK_SUCCESS) return 1;
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(VkDeviceAddress)};
+    VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push;
+    VkPipelineLayout layout{};
+    if (d.fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(d.device, &layout_info, nullptr, &layout) != VK_SUCCESS) return 1;
+    VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    info.layout = layout;
+    info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    info.stage.module = module;
+    info.stage.pName = "main";
+    VkPipeline pipeline{};
+    if (d.fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(d.device, {}, 1, &info, nullptr, &pipeline) != VK_SUCCESS) return 1;
+    gpu.wait(gpu.submit([&](VkCommandBuffer cb) {
+        const auto address = region.address();
+        d.fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        d.fn<PFN_vkCmdPushConstants>("vkCmdPushConstants")(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(address), &address);
+        d.fn<PFN_vkCmdDispatch>("vkCmdDispatch")(cb, total / 32, 1, 1);
+    }));
+    d.fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(d.device, pipeline, nullptr);
+    d.fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(d.device, layout, nullptr);
+    d.fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(d.device, module, nullptr);
+    for (unsigned i = 0; i < total; i += chunk) {
+        const auto part = std::span<const PhysicalPage>(pinned).subspan(i, chunk);
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(physical.record_readback(cb, part)); }));
+        if (g_failures || !physical.finish_readback(part)) return 1;
+    }
+    unsigned mismatches = 0;
+    for (unsigned i = 0; i < total; ++i) {
+        const auto* words = cpu(i);
+        if (words[0] != marker(i) || words[1] != (marker(i) ^ 0x5fa9142bu) ||
+            words[kPageSize / 4 - 1] != ~marker(i)) ++mismatches;
+    }
+    std::printf("span=%llu windows=3 mapped=2784 unique=2784 physical_order=interleaved-reversed "
+                "stage_batch=2097152 compute_dispatches=1 invocations=2784 shader_outputs_checked=2784 "
+                "input_and_neighbor_guards=5568 mismatches=%u\n", static_cast<unsigned long long>(bytes), mismatches);
+    for (unsigned w = 0; w < 3; ++w) {
+        auto* target = reinterpret_cast<void*>(base + w * pages_per_window * kPageSize);
+        if (map(target, pages_per_window, nullptr) != target ||
+            !release(pages_per_window, frames.data() + w * pages_per_window)) return 1;
+        // Per-page unmap preserves each placeholder. Rejoin the window before releasing the reservation.
+        if (!VirtualFree(target, pages_per_window * kPageSize, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) ||
+            !VirtualFree(target, 0, MEM_RELEASE)) return 1;
+    }
+    return mismatches || d.validation_errors() ? 1 : 0;
+}
+#endif
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--xmem-retail-backing") == 0) {
+#ifdef LEONIDA_XMEM_PAGE_MARKERS
+        return check_retail_backing();
+#else
+        return 77;
+#endif
+    }
     vktest::Device d;
     d.request_sparse = true;
     d.request_buffer_device_address = true;

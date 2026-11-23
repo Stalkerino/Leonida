@@ -846,6 +846,50 @@ int run_env_slots(bool valid) {
 
 // ---- 9. Command lists (device slot 12): the console-shaped proxy and AllocateUploadMemory ----
 
+// Slot 73 receives a four-word console description and the Xbox GCL6 interface.
+int check_xbox_list_factory() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);
+    EXPECT(device);
+    void* allocator = nullptr;
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    Mock* const host_allocator = mock->last_child;
+    const std::uint32_t description[4]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    const IID xbox_gcl6{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+    const auto pc_slot_hits = xs::device_slot_hits(12);
+    const auto xbox_slot_hits = xs::device_slot_hits(73);
+    void* list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(description), word(allocator), 0, word(&xbox_gcl6), word(&list))) == S_OK);
+    EXPECT(list && xs::is_list_proxy(list) && mock->calls[73] == 0 && mock->calls[12] == 1);
+    EXPECT(xs::device_slot_hits(73) == xbox_slot_hits + 1 && xs::device_slot_hits(12) == pc_slot_hits);
+    Mock* const host_list = mock->last_child;
+    EXPECT(host_list->kind == Kind::list && mock->args[12][2] == word(host_allocator));
+    void* alias = nullptr;
+    EXPECT(hr_of(raw(list, 0, word(&xbox_gcl6), word(&alias))) == S_OK && alias == list);
+    release(alias);
+    EXPECT(hr_of(raw(list, 9)) == S_OK && host_list->calls[9] == 1);
+    // A host implementing only the public base list cannot supply the Xbox GCL6 capability.
+    mock->full_chain_lists = false;
+    EXPECT(hr_of(raw(device, 73, word(description), word(allocator), 0, word(&xbox_gcl6), word(&alias))) ==
+           E_NOINTERFACE && !alias && mock->last_child->refs == 0);
+
+    // A caller that asks slot 73 for the public PC interface still gets the original host list.
+    const IID pc_iid = __uuidof(ID3D12GraphicsCommandList);
+    void* pc_list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(description), word(allocator), 0, word(&pc_iid), word(&pc_list))) == S_OK);
+    EXPECT(pc_list == mock->last_child && release(pc_list) == 0);
+    IID other = xbox_gcl6;
+    other.Data4[7] ^= 1;
+    void* rejected = device;
+    EXPECT(hr_of(raw(device, 73, word(description), word(allocator), 0, word(&other), word(&rejected))) ==
+           E_NOINTERFACE && !rejected && mock->last_child->refs == 0);
+    EXPECT(release(list) == 0 && host_list->refs == 0);
+    EXPECT(release(allocator) == 0 && host_allocator->refs == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    return 0;
+}
+
 int check_lists() {
     const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
     const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
@@ -914,7 +958,7 @@ int check_lists() {
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: lists come back console-shaped (cursor pinned, GetDevice, Dispatch forwarded, extras "
                 "recorded); AllocateUploadMemory hands out arena pointers a root SRV receives\n", g_label);
-    return 0;
+    return check_xbox_list_factory();
 }
 
 // ---- 10. SignalX layout detection ------------------------------------------------------------

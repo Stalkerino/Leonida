@@ -1590,6 +1590,10 @@ void note_list_slot(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint
     }
 }
 
+// Xbox GraphicsCommandList6, observed on retail titles in #6935 and #3918.
+constexpr IID kXboxGraphicsCommandList6{0xc3827890, 0x4024, 0x474c,
+                                        {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+
 // The interfaces the console list answers: the base chain, ID3D12CommandList and every graphics-command-list
 // interface the real list implements — on the console the list is a single object, so any of them returns the
 // proxy.
@@ -1628,11 +1632,12 @@ HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid) return E_POINTER;
-    if (!is_list_iid(*riid)) {
+    const IID& host_iid = IsEqualIID(*riid, kXboxGraphicsCommandList6) ? __uuidof(ID3D12GraphicsCommandList6) : *riid;
+    if (!is_list_iid(host_iid)) {
         if (supports_iid(self->real, *riid)) log_refused_iid("list", *riid);
         return E_NOINTERFACE;
     }
-    if (!supports_iid(self->real, *riid)) return E_NOINTERFACE;
+    if (!supports_iid(self->real, host_iid)) return E_NOINTERFACE;
     *out = self;
     list_add_ref(self);
     return S_OK;
@@ -1816,7 +1821,6 @@ HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void*
 // allocator proxy, which the real device unwraps to the real allocator; the created list goes back console-shaped.
 HRESULT proxy_create_command_list(DeviceProxy* self, std::uint64_t node_mask, std::uint64_t type,
                                   std::uint64_t allocator, std::uint64_t pso, const IID* riid, void** out) {
-    note_slot(12);
     if (out) *out = nullptr;  // as slot 8
     if (!riid) return E_POINTER;
     if (!out) return self->real->CreateCommandList(static_cast<UINT>(node_mask),
@@ -1940,6 +1944,9 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
         std::fprintf(stderr,
                      "[rt] d3d12_xs: slot 73 CreateCommandListX desc words 0x%08x 0x%08x -> node mask 0, type %d\n",
                      words[0], words[1], static_cast<int>(type));
+
+    if (IsEqualIID(*riid, kXboxGraphicsCommandList6))
+        return proxy_create_command_list(self, 0, type, allocator_word, initial_state_word, riid, out);
 
     // Leonida wraps its Vulkan allocators; a PC allocator comes back unwrapped and is passed as it is. Pipeline states
     // are not wrapped by this proxy, so initial_state is already the real object (a proxy there is passed through too).
@@ -2233,6 +2240,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_command_allocator(self, a1, reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 12) {
+        note_slot(12);
         return hr_to_u64(proxy_create_command_list(self, a1, a2, a3, a4, reinterpret_cast<const IID*>(a5),
                                                    reinterpret_cast<void**>(a6)));
     } else if constexpr (Slot == 36) {
